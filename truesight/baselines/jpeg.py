@@ -1,0 +1,1 @@
+"""JPEG/WebP baseline."""
