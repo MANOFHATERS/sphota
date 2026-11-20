@@ -38,17 +38,19 @@ SIZE_TARGET_FRACTION = 0.80
 
 # ----------------------------------------------------------------------------------------------- design matrix
 def design_matrix(df, n_modes=N_MODES):
-    """Features -> (X, column names): log1p of the heavy-tailed Step 5 features, resolution terms when the table has ``w`` and
-    ``h`` (JPEG-like headers weigh more on small images: the Step 5 lesson), and the mode index one-hot encoded."""
+    """Features -> (X, column names): log1p of the heavy-tailed Step 5 features, the 1/pixels term when the table has ``w`` and
+    ``h`` (headers weigh more on small images: the Step 5 lesson), and the mode index one-hot encoded."""
     cols, names = [], []
     for f in FEATURES:
         v = df[f].to_numpy(dtype=float)
         cols.append(np.log1p(v) if f in SKEWED else v)
         names.append(f)
     if {"w", "h"} <= set(df.columns):
+        # ONE resolution term: the fixed header cost adds ~1/pixels to bpp. A second one (log pixels) is collinear with it
+        # whenever the table has only a few distinct image sizes and makes the unregularised linear model explode.
         px = (df["w"] * df["h"]).to_numpy(dtype=float)
-        cols += [np.log(px), 1e5 / px]
-        names += ["log_pixels", "inv_pixels"]
+        cols.append(1e5 / px)
+        names.append("inv_pixels")
     m = df["mode"].to_numpy(dtype=int)
     if m.min() < 0 or m.max() >= n_modes:
         raise ValueError(f"mode index outside 0..{n_modes - 1}")
@@ -72,6 +74,7 @@ def make_models(groups=None, seed=0, n_splits=5):
         cv = list(GroupKFold(min(n_splits, len(np.unique(g)))).split(np.zeros(len(g)), groups=g))
     alphas = np.logspace(-4, 2, 25)
     return {
+        # plain least squares; the one-hot mode columns are collinear with the intercept (equal, cancelling offsets, no effect)
         "linear": make_pipeline(StandardScaler(), LinearRegression()),
         "ridge": make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 25), cv=cv)),
         "lasso": make_pipeline(StandardScaler(), LassoCV(alphas=alphas, cv=cv or 5, max_iter=50000, random_state=seed)),

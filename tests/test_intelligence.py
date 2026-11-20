@@ -37,11 +37,11 @@ def _split(df, frac=0.3, seed=0):
 def test_design_matrix_columns_log_scaling_and_mode_one_hot():
     df = _mode_table(5)
     X, names = rc.design_matrix(df)
-    assert names[:7] == FEATURES and names[7:9] == ["log_pixels", "inv_pixels"] and names[-6:] == [f"mode_{k}" for k in range(6)]
-    assert X.shape == (30, 7 + 2 + 6)
+    assert names[:7] == FEATURES and names[7] == "inv_pixels" and names[-6:] == [f"mode_{k}" for k in range(6)]
+    assert X.shape == (30, 7 + 1 + 6)
     assert np.allclose(X[:, names.index("lap_var")], np.log1p(df.lap_var)) and np.allclose(X[:, names.index("entropy")], df.entropy)
     assert (X[:, -6:].sum(1) == 1).all() and (X[:, -6:].argmax(1) == df["mode"].to_numpy()).all()
-    assert "log_pixels" not in rc.design_matrix(df.drop(columns=["w", "h"]))[1]
+    assert "inv_pixels" not in rc.design_matrix(df.drop(columns=["w", "h"]))[1]
     with pytest.raises(ValueError):
         rc.design_matrix(df.assign(mode=9))
 
@@ -56,6 +56,27 @@ def test_all_six_models_predict_log_bpp_on_held_out_images():
     assert ev["ridge"]["within_10pct"] > 0.8 and ev["linear"]["within_10pct"] > 0.8
     q = rc.fit_models(train, "lpips", names=rc.TREE_MODELS)
     assert set(q) == set(rc.TREE_MODELS) and all(r["r2"] > 0.8 for r in rc.evaluate_models(q, test, "lpips").values())
+
+
+def test_unregularised_linear_model_stays_stable_on_unseen_image_sizes():
+    """Regression: with only two distinct training sizes, two resolution columns were collinear and the plain linear model's
+    coefficients exploded (R^2 ~ -1e21) on images of another size. One resolution term must be enough."""
+    df = _mode_table(160)
+    small = df.image % 2 == 0
+    df.loc[small, ["w", "h"]] = 256
+    train = df[df.image < 100].reset_index(drop=True)
+    test = df[df.image >= 100].reset_index(drop=True)
+    test[["w", "h"]] = 384                                                   # a size the training table never had
+    lin = rc.fit_models(train, "log_bpp", names=["linear"])["linear"]
+    r2 = rc.evaluate_models({"linear": lin}, test)["linear"]["r2"]
+    assert np.isfinite(r2) and r2 > 0.8
+    pred = rc.predict(lin, test)
+    assert np.abs(pred - rc.target_log_bpp(test)).max() < 1.0               # no wild predictions on the unseen size
+    coef = lin[-1].coef_
+    names = rc.design_matrix(test)[1]
+    non_mode = [abs(c) for c, n in zip(coef, names) if not n.startswith('mode_')]
+    assert max(non_mode) < 5                                                 # (the six one-hot mode columns are collinear with the
+                                                                             # intercept: they may carry equal, cancelling offsets)
 
 
 def test_lasso_keeps_the_informative_features_and_drops_the_dead_ones():
