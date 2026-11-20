@@ -243,14 +243,17 @@ Each week ends with a done-criteria checklist. If a target is missed, log the re
 These commands will work once the corresponding modules are implemented.
 
 ```bash
-python scripts/prepare_data.py            # download, clean, split datasets
-python -m truesight.codec.train_codec --config configs/codec.yaml
-python -m truesight.diffusion.train_diffusion --config configs/diffusion.yaml
-python scripts/eval_rd.py --config configs/eval.yaml
-python scripts/eval_faithfulness.py --config configs/eval.yaml
-python scripts/make_figures.py
+python scripts/prepare_data.py                                  # download, clean, split datasets (Step 1)
+python scripts/train_all_lambdas.py --no-ablation               # the six codecs (Step 7); resumes from last.pt, crash-safe
+python -m truesight.diffusion.train_diffusion --codec experiments/step7_codec/lmbda0.0018/final.pt --out experiments/step10_diffusion
+python scripts/eval_codec.py && python scripts/eval_diffusion.py
+python scripts/make_figures.py                                  # every table and figure from the evaluation outputs
 pytest tests/
 ```
+
+Everything in one resumable command: `bash scripts/run_full_pipeline.sh` (see [CLOUD_RUNBOOK.md](CLOUD_RUNBOOK.md)).
+On Kaggle, with 12-hour sessions that pause and continue by themselves: `python scripts/kaggle_run.py --sync hf:USER/REPO`
+(see [KAGGLE.md](KAGGLE.md)). Training saves its exact state on a time limit or a crash and continues from there.
 
 ## 11. Conventions
 
