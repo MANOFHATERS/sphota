@@ -2,6 +2,7 @@
 
     python scripts/train_size_predictor.py                    # features (resumable) then models
     python scripts/train_size_predictor.py --stage features
+    python scripts/train_size_predictor.py --stage crops      # 256x256 crops of train/val images (needs the raw images)
     python scripts/train_size_predictor.py --stage model
 
 Target: log(JPEG bpp at quality 10). Models: StandardScaler + {Linear, Ridge, Lasso, ElasticNet}.
@@ -19,12 +20,56 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from truesight.analysis.features import FEATURES, extract_all  # noqa: E402
+from truesight.analysis.features import FEATURES, extract_all, image_features, jpeg_bpp  # noqa: E402
 
 OUT = ROOT / "experiments" / "step5_size_predictor"
+CROPS_CSV = ROOT / "data" / "processed" / "features_crops.csv"
 FIGS = ROOT / "report" / "figures"
 SKEWED = ["grad_mean", "lap_var", "edge_density"]
 ALPHAS = np.logspace(-5, 2, 36)
+
+
+def _crop_rows(args):
+    """Features + JPEG-q10 target of ``n`` random size x size crops of one image (seeded by the path)."""
+    path, role, size, n, seed = args
+    from PIL import Image
+    try:
+        img = Image.open(ROOT / path).convert("RGB")
+        rng = np.random.default_rng((seed + sum(map(ord, path))) % (2 ** 32))     # deterministic per image
+        rows = []
+        for k in range(n):
+            if img.width < size or img.height < size:
+                break
+            x0, y0 = int(rng.integers(0, img.width - size + 1)), int(rng.integers(0, img.height - size + 1))
+            c = img.crop((x0, y0, x0 + size, y0 + size))
+            r = image_features(c)
+            r["jpeg10_bpp"] = jpeg_bpp(c, 10)
+            r.update(path=f"{path}#crop{k}", role=role, dataset="crop", w=size, h=size, ok=True)
+            rows.append(r)
+        return rows
+    except Exception as e:
+        return [dict(path=path, role=role, ok=False, error=str(e))]
+
+
+def extract_crops(size=256, per_image=2, workers=3, seed=0):
+    """Small-image training rows: JPEG headers weigh far more on 256x256 files, so the size terms need small images
+    in the training data. Only train/val images are cropped (never test sets). Resumable."""
+    from concurrent.futures import ProcessPoolExecutor
+    df = pd.read_csv(ROOT / "data" / "processed" / "features.csv")
+    src = df[df.ok.astype(bool) & df.role.isin(["train", "val"])]
+    done = set()
+    if CROPS_CSV.exists():
+        old = pd.read_csv(CROPS_CSV); done = set(old.path.str.replace(r"#crop\d+$", "", regex=True))
+    else:
+        old = pd.DataFrame()
+    todo = [(p, r, size, per_image, seed) for p, r in zip(src.path, src.role) if p not in done]
+    print(f"cropping {len(todo)} images ({len(done)} cached) -> {size}x{size} x {per_image}", flush=True)
+    for i in range(0, len(todo), 300):
+        with ProcessPoolExecutor(workers, max_tasks_per_child=50) as ex:
+            rows = [r for rs in ex.map(_crop_rows, todo[i:i + 300], chunksize=4) for r in rs]
+        old = pd.concat([old, pd.DataFrame(rows)], ignore_index=True); old.to_csv(CROPS_CSV, index=False)
+        print(f"  crops {min(i + 300, len(todo))}/{len(todo)}", flush=True)
+    return old
 
 
 def make(kind, alpha=1.0, l1=0.5):
@@ -116,12 +161,19 @@ def regularisation_plot(X, y, cols):
 def main():
     warnings.filterwarnings("ignore")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["features", "model", "all"], default="all")
+    ap.add_argument("--stage", choices=["features", "crops", "model", "all"], default="all")
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--crop-size", type=int, default=256)
+    ap.add_argument("--crops-per-image", type=int, default=2)
     a = ap.parse_args()
     if a.stage in ("features", "all"):
         extract_all(workers=a.workers)
-    if a.stage == "features":
+    if a.stage in ("crops", "all"):
+        try:
+            extract_crops(a.crop_size, a.crops_per_image, a.workers)
+        except (FileNotFoundError, OSError) as e:        # raw images not on disk: use cached crops if there are any
+            print(f"crop stage skipped ({e})", flush=True)
+    if a.stage in ("features", "crops"):
         return
     from sklearn.metrics import r2_score
     OUT.mkdir(parents=True, exist_ok=True); FIGS.mkdir(parents=True, exist_ok=True)
@@ -129,7 +181,15 @@ def main():
     df = df[df.ok.astype(bool)]
     df["y"] = np.log(df["jpeg10_bpp"])
     df["log_pixels"] = np.log(df["w"] * df["h"])       # resolution: JPEG headers weigh more on small images
+    df["inv_pixels"] = 1e5 / (df["w"] * df["h"])
     fit = df[df.role.isin(["train", "val"])]
+    crops = None
+    if CROPS_CSV.exists():                                # small-image rows for the size-aware variant only
+        crops = pd.read_csv(CROPS_CSV)
+        crops = crops[crops.ok.astype(bool)].copy()
+        crops["y"] = np.log(crops["jpeg10_bpp"]); crops["log_pixels"] = np.log(crops["w"] * crops["h"])
+        crops["inv_pixels"] = 1e5 / (crops["w"] * crops["h"])
+        print(f"crop rows for the size-aware variant: {len(crops)} ({crops.w.iloc[0]}x{crops.h.iloc[0]})", flush=True)
     tests = {r: g for r, g in df.groupby("role") if r.startswith("test_")}
     print(f"fit images (train+val): {len(fit)}; test sets: { {k: len(v) for k, v in tests.items()} }", flush=True)
     print(f"target log(JPEG q10 bpp): mean {df.y.mean():.2f}, std {df.y.std():.2f}", flush=True)
@@ -137,9 +197,14 @@ def main():
     res = {"n_fit": len(fit), "target": "log(jpeg10_bpp)", "variants": {}}
     variants = {"guide (7 raw features)": (FEATURES, False), "7 features, log1p on skewed": (FEATURES, True),
                 "without jpeg50_bpp (6 features, log1p)": ([c for c in FEATURES if c != "jpeg50_bpp"], True),
-                "7 features + log_pixels, log1p": (FEATURES + ["log_pixels"], True)}
+                "7 features + log_pixels, log1p": (FEATURES + ["log_pixels"], True),
+                # JPEG header bytes are ~constant, so they add ~1/pixels to bpp: this term fixes small images (256x256 faces)
+                "7 features + inv_pixels + log_pixels, log1p": (FEATURES + ["inv_pixels", "log_pixels"], True)}
+    if crops is not None and len(crops):
+        variants["size-aware: 7 features + inv_pixels + log_pixels + crops, log1p"] = (FEATURES + ["inv_pixels", "log_pixels"], True)
     for vname, (cols, lg) in variants.items():
-        X, y = design(fit, cols, lg), fit.y.to_numpy()
+        fit_v = pd.concat([fit, crops], ignore_index=True) if vname.startswith("size-aware") else fit
+        X, y = design(fit_v, cols, lg), fit_v.y.to_numpy()
         v = {}
         for kind in ("Linear", "Ridge", "Lasso", "ElasticNet"):
             mu, sd = nested_cv(X, y, kind)
@@ -162,6 +227,13 @@ def main():
     best_name = max(res["variants"]["guide (7 raw features)"], key=lambda k: res["variants"]["guide (7 raw features)"][k]["cv_r2_mean"])
     res["best_guide_model"] = {"name": best_name, **{k: res["variants"]["guide (7 raw features)"][best_name][k] for k in ("cv_r2_mean", "cv_r2_std")}}
     res["target_r2_ge_0.6"] = res["best_guide_model"]["cv_r2_mean"] >= 0.6
+    # Robust choice across ALL variants: the model whose WORST held-out R2 over the test sets is highest (a model that
+    # explodes on one set, e.g. Linear + inv_pixels on 256x256 faces, can never win this).
+    cand = [(min(m["heldout_test_r2"].values()), vn, k, m) for vn, v in res["variants"].items() for k, m in v.items()]
+    worst, vn, k, m = max(cand, key=lambda t: t[0])
+    res["best_overall_model"] = {"variant": vn, "name": k, "worst_heldout_r2": round(worst, 4), "cv_r2_mean": m["cv_r2_mean"],
+                                 "heldout_test_r2": m["heldout_test_r2"], "selection": "max over (variant, model) of min held-out R2"}
+    print("best overall (max-min held-out R2):", res["best_overall_model"], flush=True)
     lasso = res["variants"]["guide (7 raw features)"]["Lasso"]["coefficients"]
     res["lasso_surviving_features"] = {k: v for k, v in lasso.items() if abs(v) > 1e-6}
     (OUT / "results.json").write_text(json.dumps(res, indent=2))
