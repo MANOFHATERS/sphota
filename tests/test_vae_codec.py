@@ -134,7 +134,7 @@ def test_training_resume_final_and_load(tmp_path):
     assert log["it"].tolist() == [2, 4, 6, 8, 10, 12]                    # continued from 6, no restart from 0
     assert np.isfinite(log[["loss", "bpp", "mse", "aux"]].to_numpy()).all()
     net, cfg = load_codec(run / "final.pt")
-    assert cfg == dict(N=N, M=M, K=3, lmbda=0.013) and not net.training
+    assert cfg == dict(N=N, M=M, K=3, lmbda=0.013, act="gdn") and not net.training
     res = evaluate_codec(net, lst, max_images=2, with_perceptual=False)
     assert len(res) == 2 and (res.bpp > 0).all() and np.isfinite(res.psnr).all()
     assert (res.bpp - (res.bpp_y + res.bpp_z)).abs().max() < 1e-6

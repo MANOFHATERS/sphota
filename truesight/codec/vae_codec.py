@@ -46,13 +46,18 @@ class TrueSightCodec(nn.Module):
 
     DOWN = 64             # required divisibility of H and W
 
-    def __init__(self, N=128, M=192, K=3):
+    def __init__(self, N=128, M=192, K=3, act="gdn"):
+        """``act`` is the activation of g_a / g_s: "gdn" (the guide's choice) or "relu" (ablation A2)."""
         super().__init__()
-        self.N, self.M, self.K = N, M, K
-        self.g_a = nn.Sequential(conv(3, N), GDN(N), conv(N, N), GDN(N),
-                                 conv(N, N), GDN(N), conv(N, M))
-        self.g_s = nn.Sequential(deconv(M, N), GDN(N, inverse=True), deconv(N, N), GDN(N, inverse=True),
-                                 deconv(N, N), GDN(N, inverse=True), deconv(N, 3))
+        if act not in ("gdn", "relu"):
+            raise ValueError(f"act must be 'gdn' or 'relu', got {act!r}")
+        self.N, self.M, self.K, self.act = N, M, K, act
+        fwd = (lambda: GDN(N)) if act == "gdn" else (lambda: nn.ReLU())
+        inv = (lambda: GDN(N, inverse=True)) if act == "gdn" else (lambda: nn.ReLU())
+        self.g_a = nn.Sequential(conv(3, N), fwd(), conv(N, N), fwd(),
+                                 conv(N, N), fwd(), conv(N, M))
+        self.g_s = nn.Sequential(deconv(M, N), inv(), deconv(N, N), inv(),
+                                 deconv(N, N), inv(), deconv(N, 3))
         self.h_a = nn.Sequential(conv(M, N, 3, 1), nn.LeakyReLU(inplace=True),
                                  conv(N, N), nn.LeakyReLU(inplace=True), conv(N, N))
         self.h_s = nn.Sequential(deconv(N, M), nn.LeakyReLU(inplace=True),

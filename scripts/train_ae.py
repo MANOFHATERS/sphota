@@ -102,4 +102,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from truesight import runtime
+    runtime.run_cli(main)

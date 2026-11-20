@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .. import runtime
 from ..data import CropDataset, FullImageDataset
 from ..metrics import psnr
 from .layers import PlainAE, entropy_bits
@@ -55,20 +56,29 @@ def train_ae(train_list, out_dir, M=32, N=128, iters=30000, batch=16, crop=256, 
     model.train()
     t0, run = time.time(), []
     last = iters if stop_at is None else min(iters, stop_at)
-    while it < last:
-        x = next(stream).to(device)
-        loss = F.mse_loss(model(x), x)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        it += 1
-        run.append(loss.item())
-        if it % log_every == 0 or it == iters:
-            mse = float(np.mean(run)); run = []
-            log.append(dict(iter=it, mse=mse, psnr_batch=float(10 * np.log10(1 / mse)), sec=round(time.time() - t0, 1)))
-            print(f"[M={M}] it {it}/{iters}  mse {mse:.5f}  psnr~{log[-1]['psnr_batch']:.2f} dB  {log[-1]['sec']}s", flush=True)
-        if it % ckpt_every == 0 or it == last:
-            save_ckpt(ck, model, opt, it, M, N, seed, log)
+    guard = runtime.guard()
+
+    def save():                                          # reads the loop's current ``it`` and weights
+        save_ckpt(ck, model, opt, it, M, N, seed, log)
+        guard.saved()
+
+    with runtime.crash_safe(save, f"M={M}", lambda: runtime.finite_params(model)):
+        while it < last:
+            x = next(stream).to(device)
+            loss = F.mse_loss(model(x), x)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            it += 1
+            run.append(loss.item())
+            if it % log_every == 0 or it == iters:
+                mse = float(np.mean(run)); run = []
+                log.append(dict(iter=it, mse=mse, psnr_batch=float(10 * np.log10(1 / mse)), sec=round(time.time() - t0, 1)))
+                print(f"[M={M}] it {it}/{iters}  mse {mse:.5f}  psnr~{log[-1]['psnr_batch']:.2f} dB  {log[-1]['sec']}s", flush=True)
+            if it % ckpt_every == 0 or it == last or guard.save_due():
+                save()
+            if it < last:
+                runtime.pause_if_needed(save, f"M={M}")
     with open(out_dir / "train_log.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["iter", "mse", "psnr_batch", "sec"]); w.writeheader(); w.writerows(log)
     return model, log

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .. import runtime
 from ..codec.train_codec import load_codec
 from ..data import CropDataset
 from .decode import coarse_decode
@@ -71,8 +72,14 @@ def load_unet(path, device="cpu", use_ema=True):
 
 def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4, weight_decay=1e-4, warmup=2000,
                     ema_decay=0.999, p_drop=0.1, channels=CHANNELS, T=1000, kind="cosine", clip=1.0, ckpt_every=5000,
-                    log_every=100, workers=4, seed=0, train_list=None, device=None, amp=None, stop_at=None):
-    """Train (or resume) the conditional decoder. ``stop_at`` stops early after saving, used to test resume."""
+                    log_every=100, workers=4, seed=0, train_list=None, device=None, amp=None, stop_at=None,
+                    optimizer="adamw", lr_schedule="cosine"):
+    """Train (or resume) the conditional decoder. ``stop_at`` stops early after saving, used to test resume.
+    ``kind`` (noise schedule), ``optimizer`` ("adamw" | "adam") and ``lr_schedule`` ("cosine" | "constant") are the three
+    settings of ablations A7 / A8. Raises ``runtime.Paused`` after saving when the session time budget is used up, and writes
+    last.pt before re-raising if anything crashes, so the run always continues from where it stopped."""
+    if optimizer not in ("adamw", "adam") or lr_schedule not in ("cosine", "constant"):
+        raise ValueError(f"optimizer must be adamw|adam and lr_schedule cosine|constant, got {optimizer!r}, {lr_schedule!r}")
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     use_amp = (device.type == "cuda") if amp is None else (amp and device.type == "cuda")
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
@@ -82,10 +89,11 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
     codec.requires_grad_(False)
     sched = Schedule(T, kind, device=device)
     cfg = {"unet": unet_config(crop, channels), "T": T, "kind": kind, "codec_lmbda": codec_cfg["lmbda"],
-           "p_drop": p_drop, "ema_decay": ema_decay}
+           "p_drop": p_drop, "ema_decay": ema_decay, "optimizer": optimizer, "lr_schedule": lr_schedule}
     unet = make_unet(**cfg["unet"]).to(device)
     ema = copy.deepcopy(unet).eval().requires_grad_(False)
-    opt = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = (torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=weight_decay) if optimizer == "adamw"
+           else torch.optim.Adam(unet.parameters(), lr=lr))
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     step, last = 0, out / "last.pt"
     if last.exists():                                              # resume
@@ -112,36 +120,45 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
 
     unet.train()
     t0, stop = time.time(), (iters if stop_at is None else min(iters, stop_at))
-    while step < stop:
-        cur_lr = lr_at(step, iters, warmup, lr)
-        for g in opt.param_groups:
-            g["lr"] = cur_lr
-        x = next(batches).to(device, non_blocking=True)
-        x0 = x * 2 - 1                                             # images in [-1, 1]
-        c = coarse_decode(codec, x) * 2 - 1                        # condition in [-1, 1] (rounded-latent decode)
-        c = drop_condition(c, p_drop)                              # null condition (zeros) for CFG
-        t = torch.randint(0, T, (x.size(0),), device=device)
-        eps = torch.randn_like(x0)
-        xt = sched.q_sample(x0, t, eps)
-        with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
-            eps_hat = unet(torch.cat([xt, c], 1), t).sample
-        loss = F.mse_loss(eps_hat.float(), eps)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite loss at step {step}: {loss.item()}")
-        opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(unet.parameters(), clip)
-        scaler.step(opt)
-        scaler.update()
-        update_ema(ema, unet, ema_decay)
-        step += 1
-        if step % log_every == 0:
-            w.writerow([step, loss.item(), cur_lr]); logf.flush()
-            print(f"step {step}/{iters} loss {loss.item():.4f} lr {cur_lr:.2e} {time.time() - t0:.0f}s", flush=True)
-        if step % ckpt_every == 0 or step == stop:
-            _atomic_save({"unet": unet.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                          "scaler": scaler.state_dict(), "step": step, "config": cfg}, last)
+    guard = runtime.guard()
+
+    def save():                                                    # reads the loop's current ``step`` and weights
+        _atomic_save({"unet": unet.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
+                      "scaler": scaler.state_dict(), "step": step, "config": cfg}, last)
+        guard.saved()
+
+    with runtime.crash_safe(save, "diffusion", lambda: runtime.finite_params(unet, ema)):
+        while step < stop:
+            cur_lr = lr if lr_schedule == "constant" else lr_at(step, iters, warmup, lr)
+            for g in opt.param_groups:
+                g["lr"] = cur_lr
+            x = next(batches).to(device, non_blocking=True)
+            x0 = x * 2 - 1                                         # images in [-1, 1]
+            c = coarse_decode(codec, x) * 2 - 1                    # condition in [-1, 1] (rounded-latent decode)
+            c = drop_condition(c, p_drop)                          # null condition (zeros) for CFG
+            t = torch.randint(0, T, (x.size(0),), device=device)
+            eps = torch.randn_like(x0)
+            xt = sched.q_sample(x0, t, eps)
+            with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
+                eps_hat = unet(torch.cat([xt, c], 1), t).sample
+            loss = F.mse_loss(eps_hat.float(), eps)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite loss at step {step}: {loss.item()}")
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), clip)
+            scaler.step(opt)
+            scaler.update()
+            update_ema(ema, unet, ema_decay)
+            step += 1
+            if step % log_every == 0:
+                w.writerow([step, loss.item(), cur_lr]); logf.flush()
+                print(f"step {step}/{iters} loss {loss.item():.4f} lr {cur_lr:.2e} {time.time() - t0:.0f}s", flush=True)
+            if step % ckpt_every == 0 or step == stop or guard.save_due():
+                save()
+            if step < stop:
+                runtime.pause_if_needed(save, "diffusion")
     logf.close()
     if step >= iters:
         _atomic_save({"unet": unet.state_dict(), "ema": ema.state_dict(), "step": step, "config": cfg}, out / "final.pt")
@@ -162,6 +179,8 @@ def main():
     ap.add_argument("--channels", type=int, nargs=4, default=list(CHANNELS))
     ap.add_argument("--T", type=int, default=1000)
     ap.add_argument("--schedule", choices=["linear", "cosine"], default="cosine")
+    ap.add_argument("--optimizer", choices=["adamw", "adam"], default="adamw")
+    ap.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--ckpt-every", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=0)
@@ -169,8 +188,9 @@ def main():
     a = ap.parse_args()
     train_diffusion(a.codec, a.out, iters=a.iters, batch=a.batch, crop=a.crop, lr=a.lr, warmup=a.warmup,
                     ema_decay=a.ema, p_drop=a.p_drop, channels=tuple(a.channels), T=a.T, kind=a.schedule,
-                    ckpt_every=a.ckpt_every, workers=a.workers, seed=a.seed, train_list=a.train_list)
+                    ckpt_every=a.ckpt_every, workers=a.workers, seed=a.seed, train_list=a.train_list,
+                    optimizer=a.optimizer, lr_schedule=a.lr_schedule)
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_cli(main)

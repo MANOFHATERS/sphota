@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .. import runtime
 from ..data import CropDataset
 from .vae_codec import TrueSightCodec, rd_loss
 
@@ -40,14 +41,14 @@ def lr_at(it, iters, base_lr, drop_frac=0.9, drop=0.1):
 
 
 def model_config(net, lmbda):
-    return dict(N=net.N, M=net.M, K=net.K, lmbda=lmbda)
+    return dict(N=net.N, M=net.M, K=net.K, lmbda=lmbda, act=net.act)
 
 
 def load_codec(path, device="cpu"):
     """Rebuild a codec from a final.pt / last.pt checkpoint. Returns (net in eval mode, config dict)."""
     s = torch.load(path, map_location=device)
     cfg = s["config"]
-    net = TrueSightCodec(N=cfg["N"], M=cfg["M"], K=cfg["K"]).to(device)
+    net = TrueSightCodec(N=cfg["N"], M=cfg["M"], K=cfg["K"], act=cfg.get("act", "gdn")).to(device)
     net.load_state_dict(_resize_buffers(net, s["net"]))
     return net.eval(), cfg
 
@@ -65,12 +66,14 @@ def _resize_buffers(net, state):
 
 def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256, lr=1e-4, aux_lr=1e-3, clip=1.0,
                 ckpt_every=5000, log_every=100, workers=4, seed=0, train_list=None, init_from=None, device=None,
-                stop_at=None):
-    """Train (or resume) one codec. ``stop_at`` stops early after saving, used to test resume. Returns the net."""
+                stop_at=None, act="gdn"):
+    """Train (or resume) one codec. ``stop_at`` stops early after saving, used to test resume. Returns the net.
+    ``act`` is "gdn" or "relu" (ablation A2). Raises ``runtime.Paused`` after saving when the session time budget is used up,
+    and writes last.pt before re-raising if anything crashes, so the run always continues from where it stopped."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     seed_all(seed)
-    net = TrueSightCodec(N=N, M=M, K=K).to(device)
+    net = TrueSightCodec(N=N, M=M, K=K, act=act).to(device)
     main_params, aux_params = net.split_parameters()
     opt = torch.optim.Adam(main_params, lr=lr)
     aux_opt = torch.optim.Adam(aux_params, lr=aux_lr)
@@ -84,8 +87,8 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
         print(f"[lmbda={lmbda}] resumed from iteration {it}", flush=True)
     elif init_from:                                                # fine-tune: weights only, fresh optimisers
         s = torch.load(init_from, map_location=device)
-        if (s["config"]["K"], s["config"]["M"], s["config"]["N"]) != (K, M, N):
-            raise ValueError(f"init-from config {s['config']} does not match K={K}, M={M}, N={N}")
+        if (s["config"]["K"], s["config"]["M"], s["config"]["N"], s["config"].get("act", "gdn")) != (K, M, N, act):
+            raise ValueError(f"init-from config {s['config']} does not match K={K}, M={M}, N={N}, act={act}")
         net.load_state_dict(_resize_buffers(net, s["net"]))
         print(f"[lmbda={lmbda}] initialised from {init_from}", flush=True)
 
@@ -107,30 +110,39 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
     net.train()
     t0 = time.time()
     stop = iters if stop_at is None else min(iters, stop_at)
-    while it < stop:
-        for g in opt.param_groups:
-            g["lr"] = lr_at(it, iters, lr)
-        x = next(batches).to(device, non_blocking=True)
-        out_ = net(x)                                              # entropy model stays float32 (no autocast)
-        loss, bpp, mse = rd_loss(out_, x, lmbda)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite loss at iteration {it}: loss={loss.item()} bpp={bpp.item()}")
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(main_params, clip)
-        opt.step()
-        aux = net.aux_loss()
-        aux_opt.zero_grad(set_to_none=True)
-        aux.backward()
-        aux_opt.step()
-        it += 1
-        if it % log_every == 0:
-            w.writerow([it, loss.item(), bpp.item(), mse.item(), aux.item()]); logf.flush()
-            print(f"[lmbda={lmbda}] it {it}/{iters} loss {loss.item():.4f} bpp {bpp.item():.4f} "
-                  f"psnr~{-10 * np.log10(max(mse.item(), 1e-12)):.2f} aux {aux.item():.1f} {time.time() - t0:.0f}s", flush=True)
-        if it % ckpt_every == 0 or it == stop:
-            _atomic_save({"net": net.state_dict(), "opt": opt.state_dict(), "aux": aux_opt.state_dict(), "it": it,
-                          "config": model_config(net, lmbda)}, last)
+    guard = runtime.guard()
+
+    def save():                                                    # reads the loop's current ``it`` and weights
+        _atomic_save({"net": net.state_dict(), "opt": opt.state_dict(), "aux": aux_opt.state_dict(), "it": it,
+                      "config": model_config(net, lmbda)}, last)
+        guard.saved()
+
+    with runtime.crash_safe(save, f"lmbda={lmbda}", lambda: runtime.finite_params(net)):
+        while it < stop:
+            for g in opt.param_groups:
+                g["lr"] = lr_at(it, iters, lr)
+            x = next(batches).to(device, non_blocking=True)
+            out_ = net(x)                                          # entropy model stays float32 (no autocast)
+            loss, bpp, mse = rd_loss(out_, x, lmbda)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite loss at iteration {it}: loss={loss.item()} bpp={bpp.item()}")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(main_params, clip)
+            opt.step()
+            aux = net.aux_loss()
+            aux_opt.zero_grad(set_to_none=True)
+            aux.backward()
+            aux_opt.step()
+            it += 1
+            if it % log_every == 0:
+                w.writerow([it, loss.item(), bpp.item(), mse.item(), aux.item()]); logf.flush()
+                print(f"[lmbda={lmbda}] it {it}/{iters} loss {loss.item():.4f} bpp {bpp.item():.4f} "
+                      f"psnr~{-10 * np.log10(max(mse.item(), 1e-12)):.2f} aux {aux.item():.1f} {time.time() - t0:.0f}s", flush=True)
+            if it % ckpt_every == 0 or it == stop or guard.save_due():
+                save()
+            if it < stop:
+                runtime.pause_if_needed(save, f"lmbda={lmbda}")
     logf.close()
     if it >= iters:
         _atomic_save({"net": net.state_dict(), "it": it, "config": model_config(net, lmbda)}, out / "final.pt")
@@ -153,10 +165,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--train-list", default=None)
     ap.add_argument("--init-from", default=None, help="final.pt of another lambda to fine-tune from")
+    ap.add_argument("--act", choices=["gdn", "relu"], default="gdn", help="activation of g_a / g_s (relu = ablation A2)")
     a = ap.parse_args()
     train_codec(a.lmbda, a.out, K=a.K, N=a.N, M=a.M, iters=a.iters, batch=a.batch, crop=a.crop, lr=a.lr,
-                ckpt_every=a.ckpt_every, workers=a.workers, seed=a.seed, train_list=a.train_list, init_from=a.init_from)
+                ckpt_every=a.ckpt_every, workers=a.workers, seed=a.seed, train_list=a.train_list, init_from=a.init_from,
+                act=a.act)
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_cli(main)
