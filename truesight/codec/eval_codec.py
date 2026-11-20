@@ -42,6 +42,28 @@ def mean_point(df, **extra):
     return {**extra, **{c: float(df[c].mean()) for c in df.columns if c != "image"}}
 
 
+def ablation_act(gdn, relu):
+    """A2, ReLU vs GDN. ``gdn`` is the K=3 GDN curve (columns lmbda, bpp, psnr, >= 2 points), ``relu`` the ReLU runs. For each
+    ReLU point: the raw bpp / PSNR difference at the identical lambda and the bpp the GDN curve needs for the same PSNR
+    (interpolated in log-bpp) with the change in % (negative = GDN needs fewer bits, the same convention as BD-rate and ``ablation_k``)."""
+    gdn = gdn.sort_values("psnr")
+    rows = []
+    for _, r in relu.iterrows():
+        g = gdn[np.isclose(gdn.lmbda, r.lmbda)]
+        raw = {}
+        if len(g):
+            raw = dict(bpp_gdn=float(g.bpp.iloc[0]), psnr_gdn=float(g.psnr.iloc[0]),
+                       d_bpp_pct_same_lambda=(float(g.bpp.iloc[0]) / r.bpp - 1) * 100,
+                       d_psnr_same_lambda=float(g.psnr.iloc[0]) - r.psnr)
+        if len(gdn) >= 2 and gdn.psnr.min() <= r.psnr <= gdn.psnr.max():
+            b = math.exp(float(np.interp(r.psnr, gdn.psnr.to_numpy(), np.log(gdn.bpp.to_numpy()))))
+            eq = dict(bpp_gdn_at_equal_psnr=b, saving_pct_equal_psnr=(b / r.bpp - 1) * 100)
+        else:
+            eq = dict(bpp_gdn_at_equal_psnr=float("nan"), saving_pct_equal_psnr=float("nan"))
+        rows.append(dict(lmbda=r.lmbda, bpp_relu=r.bpp, psnr_relu=r.psnr, **raw, **eq))
+    return pd.DataFrame(rows)
+
+
 def beats_baseline(codec_pts, base_pts, max_bpp=0.5):
     """For every codec point with bpp < max_bpp inside the baseline's bpp range, is codec PSNR above the baseline's
     PSNR interpolated (linearly in log-bpp) at that bpp? Returns (all_ok, details list)."""

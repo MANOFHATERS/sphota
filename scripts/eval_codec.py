@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from truesight.codec.eval_codec import (ablation_k, bd_table, beats_baseline, evaluate_codec,  # noqa: E402
+from truesight.codec.eval_codec import (ablation_act, ablation_k, bd_table, beats_baseline, evaluate_codec,  # noqa: E402
                                         mean_point)
 from truesight.codec.train_codec import load_codec  # noqa: E402
 
@@ -29,9 +29,15 @@ FIGS = ROOT / "report" / "figures"
 def find_runs(exp):
     runs = []
     for p in sorted(Path(exp).glob("*lmbda*/final.pt")):
+        if p.parent.name.startswith("relu_"):                         # ablation A2 runs are evaluated separately
+            continue
         K = 1 if p.parent.name.startswith("K1_") else 3
         runs.append((K, p))
     return runs
+
+
+def find_relu_runs(exp):
+    return sorted(Path(exp).glob("relu_lmbda*/final.pt"))
 
 
 def baseline_curves():
@@ -134,6 +140,18 @@ def main():
         ab.to_csv(exp / "ablation_k.csv", index=False)
         summary["ablation_k1_vs_k3"] = ab.round(4).to_dict("records")
         print("\nK=1 vs K=3:\n" + ab.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    relu_paths = find_relu_runs(exp)
+    if relu_paths and len(k3):
+        rp = []
+        for p in relu_paths:
+            net, cfg = load_codec(p)
+            df = evaluate_codec(net, a.test_list, max_images=a.limit, with_perceptual=not a.no_perceptual)
+            rp.append(mean_point(df, lmbda=cfg["lmbda"]))
+            print(f"ReLU lmbda={cfg['lmbda']:.4f}: {rp[-1]['bpp']:.4f} bpp  {rp[-1]['psnr']:.2f} dB", flush=True)
+        a2 = ablation_act(k3, pd.DataFrame(rp))
+        a2.to_csv(exp / "ablation_act.csv", index=False)
+        summary["ablation_a2_relu_vs_gdn"] = a2.round(4).to_dict("records")
+        print("\nReLU vs GDN (A2):\n" + a2.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     plot_rd(points, base, figs / "rd_kodak_codec.png")
     summary["training_logs_finite"] = plot_training(exp, figs / "codec_training_curves.png")
     (exp / "summary.json").write_text(json.dumps(summary, indent=2, default=lambda o: None if o != o else float(o)))
