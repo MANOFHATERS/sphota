@@ -29,8 +29,9 @@ def ddim_sample_eps(eps_fn, sched, shape, steps=50, eta=0.0, guide=None, seed=0,
     """Run the reverse process.
 
     eps_fn(x_t, t_batch) -> eps_hat      t_batch is a LongTensor of shape (B,)
-    guide(x0_hat, t) -> x0_hat           optional hook, t is the int timestep; eps_hat is re-derived from the corrected
-                                         x0_hat so the update stays consistent (this is where Step 12 plugs in)
+    guide(x0_hat, t) -> x0_hat           optional hook, t is the int timestep; if it returns a corrected x0_hat, eps_hat is
+                                         re-derived from it so the update stays consistent (this is where Step 12 plugs
+                                         in). A hook that returns x0_hat unchanged leaves the decode identical to no hook.
     x_T                                  optional starting noise (default: N(0, I) from ``seed``)
     clip                                 clamp x0_hat to [-1, 1] before the update (eps_hat is left as predicted)
     Returns x_0 in [-1, 1] (and, with return_trace, the list of (t, x0_hat) pairs).
@@ -50,8 +51,11 @@ def ddim_sample_eps(eps_fn, sched, shape, steps=50, eta=0.0, guide=None, seed=0,
         if clip:
             x0 = x0.clamp(-1, 1)
         if guide is not None:
-            x0 = guide(x0, t)
-            eps = sched.predict_eps(x, tt, x0)              # re-derive eps from the corrected x0 (as in the guide)
+            x0_guided = guide(x0, t)
+            if x0_guided is not x0 and not torch.equal(x0_guided, x0):
+                x0 = x0_guided
+                eps = sched.predict_eps(x, tt, x0)          # x0 was corrected: re-derive eps from it (as in the guide)
+            # a hook that changed nothing (skipped step, measure-only) leaves the trajectory identical to no hook
         sigma = eta * ((1 - ab_prev) / (1 - ab)).sqrt() * (1 - ab / ab_prev).sqrt() if t_prev >= 0 else 0.0
         dir_xt = (1 - ab_prev - sigma ** 2).clamp(min=0).sqrt() * eps
         x = ab_prev.sqrt() * x0 + dir_xt

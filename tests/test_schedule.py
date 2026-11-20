@@ -212,6 +212,17 @@ def test_identity_guide_changes_nothing_when_no_clipping_is_active():
     assert torch.allclose(a, b, atol=1e-5)
 
 
+def test_a_hook_that_changes_nothing_leaves_the_decode_identical_even_when_clipping_is_active():
+    sched = Schedule(1000)
+    wild = lambda x, tt: x * 3.0                                      # large eps estimates -> x0_hat is clipped at +-1 often
+    plain = ddim_sample_eps(wild, sched, (2, 3, 4, 4), steps=8, seed=0)
+    noop = ddim_sample_eps(wild, sched, (2, 3, 4, 4), steps=8, seed=0, guide=lambda x0, t: x0)
+    same_values = ddim_sample_eps(wild, sched, (2, 3, 4, 4), steps=8, seed=0, guide=lambda x0, t: x0.clone())
+    assert torch.equal(plain, noop) and torch.equal(plain, same_values)
+    changed = ddim_sample_eps(wild, sched, (2, 3, 4, 4), steps=8, seed=0, guide=lambda x0, t: x0 * 0.5)
+    assert not torch.equal(plain, changed)                            # a real correction still changes the trajectory
+
+
 class _FakeUNet:
     """eps depends on the condition: e(x, c) = 0.1 x + 0.5 c. Counts forward passes. Input is cat([x_t, c])."""
     def __init__(self, C=3):
