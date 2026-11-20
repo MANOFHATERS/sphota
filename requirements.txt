@@ -26,3 +26,8 @@ gradio
 fastapi
 uvicorn
 pytest
+requests
+imagehash
+pyarrow
+scipy
+joblib
