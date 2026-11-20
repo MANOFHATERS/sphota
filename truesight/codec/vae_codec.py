@@ -8,6 +8,7 @@ Rate R = -sum log2 p(y_hat) - sum log2 p(z_hat) (bits an ideal arithmetic coder 
 maximum-likelihood estimation of the entropy model. Loss = bpp + lambda * 255^2 * MSE (a weighted ELBO).
 Input height / width must be multiples of 64 (the hyper-encoder downsamples by another factor of 4).
 """
+import copy
 import math
 
 import torch
@@ -81,6 +82,60 @@ class TrueSightCodec(nn.Module):
         y_lik = self.gmm.likelihood(y_rate, w, mu, sigma)
         x_hat = self.g_s(y_dec)
         return {"x_hat": x_hat, "y": y, "y_hat": y_dec, "likelihoods": {"y": y_lik, "z": z_lik}}
+
+    # ------------------------------------------------------------------ real bitstreams (Step 8)
+    def prepare_for_coding(self):
+        """Call once after loading a checkpoint, before compress / decompress.
+
+        Builds the CDF tables of the factorised z-model (``entropy_bottleneck.update(force=True)``) and a float32 CPU
+        copy of h_s: the mixture parameters, and therefore the arithmetic-coder CDFs, are computed on the CPU in float32
+        on both the encoder and the decoder side so that both get bit-identical tables."""
+        self.entropy_bottleneck.update(force=True)
+        # kept in a dict so nn.Module does not register it (it must stay on the CPU when the net moves to a GPU)
+        self._coding = {"h_s": copy.deepcopy(self.h_s).float().cpu().eval()}
+        return self
+
+    def _coding_params(self, z_hat, shape):
+        """(w_logits, mu, sigma) for the coder, computed on the CPU in float32 (see prepare_for_coding)."""
+        B, _, H, W = shape
+        p = self._coding["h_s"](z_hat.detach().float().cpu()).view(B, 3, self.K, self.M, H, W)
+        return p[:, 0], p[:, 1], torch.exp(p[:, 2].clamp(max=LOG_SCALE_MAX))
+
+    @torch.no_grad()
+    def compress(self, x):
+        """x: (1, 3, H, W) in [0, 1], H and W multiples of 64. Returns a dict with the two byte streams
+        (``z``: hyper-latent, ``y``: latent), their shapes, the transmitted integer latent ``y_hat``
+        (= clamp(round(g_a(x)), -L, L)) and ``n_clamped``, the number of latent values that exceeded +-L."""
+        from .entropy_gmm import L, encode_y
+        if x.shape[0] != 1:
+            raise ValueError("compress handles one image at a time (batch size must be 1)")
+        if x.shape[-1] % self.DOWN or x.shape[-2] % self.DOWN:
+            raise ValueError(f"H and W must be multiples of {self.DOWN}, got {tuple(x.shape[-2:])}")
+        if "_coding" not in self.__dict__:
+            self.prepare_for_coding()
+        y = self.g_a(x)
+        z = self.h_a(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.shape[-2:])     # the decoder will see exactly this
+        w, mu, sigma = self._coding_params(z_hat, y.shape)
+        y_hat = torch.round(y)
+        n_clamped = int((y_hat.abs() > L).sum())
+        y_hat = y_hat.clamp(-L, L)
+        return {"z": z_strings[0], "y": encode_y(y_hat, w, mu, sigma), "z_shape": tuple(z.shape[-2:]),
+                "y_shape": tuple(y.shape), "y_hat": y_hat.cpu(), "n_clamped": n_clamped}
+
+    @torch.no_grad()
+    def decompress(self, d):
+        """Inverse of compress (uses only d['z'], d['y'], d['z_shape'], d['y_shape']). Returns x_hat in [0, 1] and the
+        decoded integer latent y_hat."""
+        from .entropy_gmm import decode_y
+        if "_coding" not in self.__dict__:
+            self.prepare_for_coding()
+        z_hat = self.entropy_bottleneck.decompress([d["z"]], tuple(d["z_shape"]))
+        w, mu, sigma = self._coding_params(z_hat, tuple(d["y_shape"]))
+        y_hat = decode_y(d["y"], w, mu, sigma)
+        dev = next(self.parameters()).device
+        return {"x_hat": self.g_s(y_hat.to(dev)).clamp(0, 1), "y_hat": y_hat}
 
     def aux_loss(self):
         """Loss of the entropy-bottleneck quantiles; optimised separately from the main loss."""
