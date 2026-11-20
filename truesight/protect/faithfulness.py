@@ -83,9 +83,12 @@ def text_faithfulness(ocr, original, decoded, min_conf=MIN_OCR_CONF, max_cer=MAX
     regions = [(b, t, c) for b, t, c in ocr.read(original) if c >= min_conf and t.strip()]
     if not regions:
         return None
-    cers = [float(cer(text, ocr.recognize(decoded, box))) for box, text, _ in regions]
+    read = [ocr.recognize(decoded, box) for box, _, _ in regions]
+    cers = [float(cer(text, r)) for (_, text, _), r in zip(regions, read)]
     ok = [c <= max_cer for c in cers]
-    return {"passed": all(ok), "n_regions": len(regions), "n_ok": int(sum(ok)), "cers": cers}
+    return {"passed": all(ok), "n_regions": len(regions), "n_ok": int(sum(ok)), "cers": cers,
+            "regions": [{"box": tuple(float(v) for v in b), "original": t, "decoded": r, "cer": c}
+                        for (b, t, _), r, c in zip(regions, read, cers)]}
 
 
 def text_faithfulness_rate(ocr, pairs, **kw):

@@ -312,6 +312,14 @@ def test_tfr_needs_all_confident_regions_to_pass_and_ignores_the_rest():
     assert text_faithfulness(ocr, "none", "d") is None and text_faithfulness(ocr, "low", "d") is None
 
 
+def test_tfr_reports_each_region_with_both_readings():
+    b1, b2 = (0, 0, 10, 10), (0, 20, 10, 30)
+    ocr = FakeOCR({"o": [(b1, "STOP", 0.9), (b2, "5 mg", 0.8)]}, {("d", b1): "STOP", ("d", b2): "8 mg"})
+    r = text_faithfulness(ocr, "o", "d")
+    assert [g["original"] for g in r["regions"]] == ["STOP", "5 mg"] and [g["decoded"] for g in r["regions"]] == ["STOP", "8 mg"]
+    assert r["regions"][1]["box"] == (0.0, 20.0, 10.0, 30.0) and r["regions"][1]["cer"] == pytest.approx(0.25)
+
+
 def test_tfr_over_a_set_counts_only_eligible_images():
     b = (0, 0, 10, 10)
     ocr = FakeOCR({"a": [(b, "HELLO", 0.9)], "b": [(b, "WORLD", 0.9)], "c": [(b, "ABCD", 0.9)], "empty": []},
