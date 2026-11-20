@@ -8,4 +8,5 @@ data/raw/*
 *.pth
 *.ckpt
 *.tsi
+*.sphota
 # Raw datasets (~43 GB) are re-created with: python scripts/prepare_data.py --stage download
