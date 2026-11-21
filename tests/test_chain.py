@@ -274,3 +274,14 @@ def test_kaggle_credentials_detection(tmp_path):
     (tmp_path / ".kaggle").mkdir()
     (tmp_path / ".kaggle" / "kaggle.json").write_text("{}")
     assert chain.have_kaggle_credentials({}, home=tmp_path)
+
+
+def test_cli_is_upgraded_once_only_for_the_new_token_type():
+    calls = []
+    fake = lambda cmd, **kw: calls.append(cmd)
+    chain._CLI_READY["done"] = False
+    assert chain.ensure_cli({}, run=fake) is False and calls == []                       # no KAGGLE_API_TOKEN: nothing to do
+    assert chain.ensure_cli({"KAGGLE_API_TOKEN": "KGAT_x"}, run=fake) is True
+    assert calls[0][1:4] == ["-m", "pip", "install"] and "kaggle" in calls[0]
+    assert chain.ensure_cli({"KAGGLE_API_TOKEN": "KGAT_x"}, run=fake) is False and len(calls) == 1   # only once
+    chain._CLI_READY["done"] = False

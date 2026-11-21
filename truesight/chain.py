@@ -125,8 +125,27 @@ def kaggle_env(base=None):
     return dict(base if base is not None else os.environ)
 
 
+_CLI_READY = {"done": False}
+
+
+def ensure_cli(env=None, run=subprocess.run):
+    """The new-style access token (KAGGLE_API_TOKEN, starts with KGAT_) needs a recent kaggle CLI, and the one preinstalled in a notebook can
+    be older: upgrade it once (best effort) before the first push. Does nothing without KAGGLE_API_TOKEN."""
+    env = os.environ if env is None else env
+    if _CLI_READY["done"] or not env.get("KAGGLE_API_TOKEN"):
+        return False
+    _CLI_READY["done"] = True
+    try:
+        run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"], capture_output=True, timeout=300)
+    except Exception:
+        return False
+    return True
+
+
 def push_kernel(folder, run=subprocess.run, env=None, kaggle_cmd=("kaggle",)):
     """``kaggle kernels push -p <folder>`` (creates a new version of the notebook and runs it). Returns (ok, output)."""
+    if run is subprocess.run:                                         # a real push (tests pass a fake runner)
+        ensure_cli()
     try:
         r = run([*kaggle_cmd, "kernels", "push", "-p", str(folder)], capture_output=True, text=True, env=env or kaggle_env(), timeout=300)
     except (OSError, subprocess.SubprocessError) as e:
