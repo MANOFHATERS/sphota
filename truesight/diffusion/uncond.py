@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .. import runtime
+from .. import runtime, speed
 from ..data import CropDataset
 from .sample import ddim_sample_eps
 from .schedule import Schedule
@@ -51,6 +51,7 @@ def train_uncond(out, iters=20_000, batch=64, crop=64, lr=2e-4, weight_decay=1e-
     saves last.pt before re-raising any crash."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     use_amp = (device.type == "cuda") if amp is None else (amp and device.type == "cuda")
+    speed.setup(device)                                           # cudnn.benchmark: only changes speed
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     seed_all(seed)
     sched = Schedule(T, kind, device=device)

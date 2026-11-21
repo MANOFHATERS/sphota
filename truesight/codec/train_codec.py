@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .. import runtime
+from .. import runtime, speed
 from ..data import CropDataset
 from .vae_codec import TrueSightCodec, rd_loss
 
@@ -73,7 +73,11 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     seed_all(seed)
+    speed.setup(device)                                           # cudnn.benchmark (fixed crop size): only changes speed
     net = TrueSightCodec(N=N, M=M, K=K, act=act).to(device)
+    use_cl = speed.use_channels_last("codec", device, amp=False)  # off by default: the codec trains in fp32 (see truesight/speed.py)
+    if use_cl:
+        speed.to_channels_last(net.g_a, net.g_s, net.h_a)
     main_params, aux_params = net.split_parameters()
     opt = torch.optim.Adam(main_params, lr=lr)
     aux_opt = torch.optim.Adam(aux_params, lr=aux_lr)
@@ -121,7 +125,7 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
         while it < stop:
             for g in opt.param_groups:
                 g["lr"] = lr_at(it, iters, lr)
-            x = next(batches).to(device, non_blocking=True)
+            x = speed.cl(next(batches).to(device, non_blocking=True), use_cl)
             out_ = net(x)                                          # entropy model stays float32 (no autocast)
             loss, bpp, mse = rd_loss(out_, x, lmbda)
             if not torch.isfinite(loss):

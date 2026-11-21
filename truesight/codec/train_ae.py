@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .. import runtime
+from .. import runtime, speed
 from ..data import CropDataset, FullImageDataset
 from ..metrics import psnr
 from .layers import PlainAE, entropy_bits
@@ -39,6 +39,7 @@ def train_ae(train_list, out_dir, M=32, N=128, iters=30000, batch=16, crop=256, 
     Returns (model, log_rows). Log rows: dict(iter, mse, psnr_batch, sec).
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    speed.setup(device)                                           # cudnn.benchmark: only changes speed
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     seed_all(seed)
     model = PlainAE(N, M).to(device)

@@ -69,7 +69,7 @@ class TrueSightCodec(nn.Module):
     def gmm_params(self, z_hat, shape):
         """Mixture parameters for a latent of ``shape`` = (B, M, H, W): (w_logits, mu, sigma), each (B,K,M,H,W)."""
         B, _, H, W = shape
-        p = self.h_s(z_hat).view(B, 3, self.K, self.M, H, W)
+        p = self.h_s(z_hat).reshape(B, 3, self.K, self.M, H, W)
         return p[:, 0], p[:, 1], torch.exp(p[:, 2].clamp(max=LOG_SCALE_MAX))
 
     def forward(self, x):

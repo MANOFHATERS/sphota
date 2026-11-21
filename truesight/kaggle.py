@@ -9,6 +9,17 @@ Kaggle stops a session after 12 hours and wipes its disk. A session therefore do
     5. run the pipeline                  every trainer resumes from its last checkpoint; stops itself before the 12 h limit
     6. save the run state                final push, plus a push every 30 minutes while running
 
+Weekly GPU quota. Kaggle ends a session without warning when the weekly GPU quota is used up, and no API tells a notebook how
+much is left. The driver therefore plans the budget itself, and never starts a session it cannot finish cleanly:
+    --quota-hours R     R = the hours the Kaggle page shows as left right now:  budget = min(--hours, R - 0.5)
+    --weekly-quota 30   the driver keeps a ledger (quota/<session>.json in the run state, uploaded with everything else) and
+                        counts the hours of the last 7 days itself:  budget = min(--hours, 30 - used - 0.5).  A session that was
+                        killed counts as having used its whole reservation, so the count can only be too high, never too low.
+With a budget below 15 minutes the session does not start (status NO_QUOTA, exit 76). Because the trainers pause and save when the
+budget is used up, the quota is never hit mid-run; the 0.5 h margin leaves time for the final upload. If the quota is wrong anyway
+(for example Kaggle counted a session you forgot), the periodic checkpoints (every 9 min) and uploads (every 15 min) limit the loss
+to about 15 minutes.
+
 Outcomes (the exit status of the pipeline):
     DONE     0    every requested stage finished
     PAUSED   75   the time budget ran out (state saved): start the next session, it continues exactly there
@@ -16,17 +27,24 @@ Outcomes (the exit status of the pipeline):
                     uploaded it; fix the code (push the fix to GitHub), start the next session, it continues from that step
 """
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from . import runtime
-from .sync import Syncer, data_pull, data_push
+from .sync import Syncer, data_pull, data_push, release_all
 
-DONE, PAUSED, CRASHED = "DONE", "PAUSED", "CRASHED"
+DONE, PAUSED, CRASHED, NO_QUOTA = "DONE", "PAUSED", "CRASHED", "NO_QUOTA"
+EXIT_NO_QUOTA = 76                       # not enough weekly GPU quota left to run a useful session
 DEFAULT_HOURS = 11.5                     # Kaggle stops at 12 h: the last 30 minutes are for the final upload
+QUOTA_MARGIN_H = 0.5                     # kept free of the quota for the final upload and for estimate errors
+MIN_USEFUL_H = 0.25                      # below this budget a session cannot even restore the state and save it again
+QUOTA_WINDOW_H = 7 * 24                  # the ledger counts the last 7 days (a rolling week never under-counts a weekly reset)
+DEFAULT_SYNC_MIN = 15.0                  # upload interval; checkpoints are written more often (see session_env)
 REQUIRED = {                              # import name -> pip name
     "compressai": "compressai", "torchac": "torchac", "lpips": "lpips", "diffusers": "diffusers", "easyocr": "easyocr",
     "facenet_pytorch": "facenet-pytorch", "sklearn": "scikit-learn", "xgboost": "xgboost", "mlxtend": "mlxtend",
@@ -126,11 +144,15 @@ def prepare_data(root, data_input=None, data_dir=None, data_repo=None):
     return "; ".join(notes) or "no data source given: the data stage downloads from the original sources"
 
 
-def session_env(spec, hours, start=None, data_repo=None, base=None):
+def session_env(spec, hours, start=None, data_repo=None, base=None, sync_every=DEFAULT_SYNC_MIN, session=None):
     env = dict(base if base is not None else os.environ)
     env["TS_SESSION_START"] = str(start if start is not None else time.time())
     env["TS_TIME_LIMIT_HOURS"] = str(hours)
     env["TS_SYNC"] = spec
+    env["TS_SAVE_EVERY_MIN"] = f"{max(2.0, min(20.0, 0.6 * sync_every)):.1f}"      # a checkpoint exists before every upload
+    env["TS_CLAIM_TTL_MIN"] = f"{max(45.0, 3 * sync_every):.0f}"
+    if session:
+        env["TS_SESSION_ID"] = session
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     if data_repo:
@@ -139,15 +161,68 @@ def session_env(spec, hours, start=None, data_repo=None, base=None):
 
 
 def classify(rc):
-    return DONE if rc == 0 else PAUSED if rc == runtime.EXIT_PAUSED else CRASHED
+    return DONE if rc == 0 else PAUSED if rc == runtime.EXIT_PAUSED else NO_QUOTA if rc == EXIT_NO_QUOTA else CRASHED
+
+
+# ------------------------------------------------------------------------------------------------ weekly quota ledger
+def ledger_dir(exp):
+    return Path(exp) / "quota"
+
+
+def read_ledger(exp):
+    """All session records of the run state: list of dicts {session, start, reserved_h, hours_used (None while running / killed)}."""
+    out = []
+    for f in sorted(ledger_dir(exp).glob("*.json")) if ledger_dir(exp).exists() else []:
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def write_ledger_entry(exp, session, start, reserved_h, hours_used=None):
+    d = ledger_dir(exp)
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f"{session}.json.tmp"
+    tmp.write_text(json.dumps({"session": session, "start": start, "reserved_h": reserved_h, "hours_used": hours_used}))
+    os.replace(tmp, d / f"{session}.json")
+
+
+def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H):
+    """GPU-session hours spent in the last ``window_h`` hours. A finished session counts its real hours, a session without
+    ``hours_used`` (still running or killed) counts its whole reservation; only the part inside the window counts."""
+    now = time.time() if now is None else now
+    lo, total = now - window_h * 3600.0, 0.0
+    for e in entries:
+        h = e.get("hours_used")
+        h = float(e["reserved_h"] if h is None else h)
+        a, b = float(e["start"]), float(e["start"]) + h * 3600.0
+        overlap = max(0.0, min(b, now) - max(a, lo))
+        total += overlap / 3600.0
+    return total
+
+
+def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None, margin_h=QUOTA_MARGIN_H):
+    """(budget in hours, explanation). ``hours`` is the session limit (11.5); the quota only ever lowers it."""
+    budget, why = float(hours), f"session limit {hours} h"
+    if quota_hours is not None and quota_hours - margin_h < budget:
+        budget, why = quota_hours - margin_h, f"{quota_hours} h of quota left - {margin_h} h margin"
+    if weekly_quota is not None:
+        used = used_quota_hours(entries, now)
+        left = weekly_quota - used - margin_h
+        if left < budget:
+            budget, why = left, f"weekly quota {weekly_quota} h - {used:.1f} h used in the last 7 days - {margin_h} h margin"
+    return max(0.0, budget), why
 
 
 def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_input=None, data_dir=None, data_repo=None,
-                sync_every=30.0, do_git_pull=True, install=True, env_extra=None):
-    """Run one session. Returns (status, exit code). ``cmd`` defaults to the full pipeline."""
+                sync_every=DEFAULT_SYNC_MIN, do_git_pull=True, install=True, env_extra=None, quota_hours=None, weekly_quota=None):
+    """Run one session. Returns (status, exit code). ``cmd`` defaults to the full pipeline.
+    ``quota_hours`` / ``weekly_quota``: see the module docstring; the budget is lowered to what the quota allows."""
     root = Path(root)
     exp = Path(exp_dir) if exp_dir else root / "experiments"
     start = time.time()
+    session = f"{int(start)}-{uuid.uuid4().hex[:6]}"
     got = load_kaggle_secrets()
     log(f"session start; budget {hours} h; run state in {spec}" + (f"; secrets loaded: {got}" if got else ""))
     if do_git_pull:
@@ -160,16 +235,33 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
         sync.pull()
     except Exception as e:                                         # a first session has nothing to pull
         log(f"nothing restored ({type(e).__name__}: {e})")
+    hours_limit = hours
+    hours, why = plan_budget(hours_limit, quota_hours, weekly_quota, read_ledger(exp), start)
+    if quota_hours is None and weekly_quota is None:
+        log("WARNING: no quota given (--quota-hours / --weekly-quota). Kaggle ends a session without warning when the weekly GPU "
+            "quota runs out and this driver cannot see it; pass the hours the Kaggle page shows as left.")
+    log(f"time budget {hours:.2f} h ({why})")
+    if hours < MIN_USEFUL_H and hours < hours_limit:               # the quota (not a short test limit) left too little
+        log(f"NO_QUOTA: only {hours:.2f} h of budget left, not starting (the run state is untouched). Try again when the weekly quota resets.")
+        return NO_QUOTA, EXIT_NO_QUOTA
     done_before = sorted(p.name for p in (exp / ".done").glob("*")) if (exp / ".done").exists() else []
     log(f"stages already finished: {done_before or 'none'}")
+    write_ledger_entry(exp, session, start, hours)                  # reserve it now: a killed session still counts
+    sync.session = session
+    try:
+        sync.push()
+    except Exception as e:
+        log(f"ledger upload failed (the next push retries): {e}")
     sync.start_background(sync_every)
-    env = session_env(spec, hours, start, data_repo)
+    env = session_env(spec, hours, start, data_repo, sync_every=sync_every, session=session)
     env.update(env_extra or {})
     cmd = cmd or ["bash", str(root / "scripts" / "run_full_pipeline.sh")]
     log("running: " + " ".join(map(str, cmd)))
     rc = subprocess.run(cmd, cwd=root, env=env).returncode
     status = classify(rc)
     sync.stop_background()
+    write_ledger_entry(exp, session, start, hours, hours_used=round((time.time() - start) / 3600.0, 4))
+    release_all(exp, session)                                       # the next session may take over this session's stages at once
     log(f"pipeline ended with status {status} (exit {rc}); saving the run state")
     for attempt in range(3):
         try:

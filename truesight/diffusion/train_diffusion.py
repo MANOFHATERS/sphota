@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .. import runtime
+from .. import runtime, speed
 from ..codec.train_codec import load_codec
 from ..data import CropDataset
 from .decode import coarse_decode
@@ -50,9 +50,15 @@ def drop_condition(c, p, generator=None):
 
 @torch.no_grad()
 def update_ema(ema, net, decay=0.999):
-    """ema <- decay * ema + (1 - decay) * net (parameters only; the U-Net has no running statistics)."""
-    for pe, pm in zip(ema.parameters(), net.parameters()):
-        pe.mul_(decay).add_(pm.detach(), alpha=1 - decay)
+    """ema <- decay * ema + (1 - decay) * net (parameters only; the U-Net has no running statistics).
+    One fused ``_foreach`` call over all parameters (same arithmetic, one multiply and one add each, as the plain loop)."""
+    pe, pm = list(ema.parameters()), [p.detach() for p in net.parameters()]
+    if hasattr(torch, "_foreach_mul_"):
+        torch._foreach_mul_(pe, decay)
+        torch._foreach_add_(pe, pm, alpha=1 - decay)
+    else:
+        for a, b in zip(pe, pm):
+            a.mul_(decay).add_(b, alpha=1 - decay)
 
 
 def _atomic_save(obj, path):
@@ -82,6 +88,8 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
         raise ValueError(f"optimizer must be adamw|adam and lr_schedule cosine|constant, got {optimizer!r}, {lr_schedule!r}")
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     use_amp = (device.type == "cuda") if amp is None else (amp and device.type == "cuda")
+    speed.setup(device)                                           # cudnn.benchmark (fixed crop size): only changes speed
+    use_cl = speed.use_channels_last("unet", device, use_amp)      # channels_last pairs with fp16 autocast on Tensor Cores
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     seed_all(seed)
 
@@ -92,6 +100,8 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
            "p_drop": p_drop, "ema_decay": ema_decay, "optimizer": optimizer, "lr_schedule": lr_schedule}
     unet = make_unet(**cfg["unet"]).to(device)
     ema = copy.deepcopy(unet).eval().requires_grad_(False)
+    if use_cl:
+        speed.to_channels_last(unet, ema)                         # the checkpoint format (state_dict values) is unchanged
     opt = (torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=weight_decay) if optimizer == "adamw"
            else torch.optim.Adam(unet.parameters(), lr=lr))
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
@@ -140,7 +150,7 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
             eps = torch.randn_like(x0)
             xt = sched.q_sample(x0, t, eps)
             with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
-                eps_hat = unet(torch.cat([xt, c], 1), t).sample
+                eps_hat = unet(speed.cl(torch.cat([xt, c], 1), use_cl), t).sample
             loss = F.mse_loss(eps_hat.float(), eps)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}: {loss.item()}")
