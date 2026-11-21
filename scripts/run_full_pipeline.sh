@@ -26,8 +26,8 @@
 # Resume rules: every trainer continues from its own last.pt; a finished stage leaves $EXP/.done/<stage>; a stage that is cut off
 # by the time budget (TS_TIME_LIMIT_HOURS) saves and exits with status 75 and is NOT marked done; a crash saves the exact state
 # first and is not marked done either. Run the same command again to continue. Logs: $EXP/logs/<stage>.log.
-# If TS_SYNC is set (hf:<user>/<repo> or dir:<path>) the run state is uploaded after every finished stage, and every stage is
-# claimed first, so two notebooks on the same repo never run (or overwrite) the same stage: run different STAGES in each.
+# If TS_SYNC is set (hf:<user>/<repo> or dir:<path>) the run state is uploaded after every finished stage. With TS_CLAIMS=1 every stage is
+# also claimed first, so two notebooks on the same repo never run (or overwrite) the same stage: run different STAGES in each.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=${PY:-python}
@@ -71,8 +71,11 @@ CODEC=$EXP/step7_codec; DIFF=$EXP/step10_diffusion
 LO=$CODEC/lmbda0.0018/final.pt; HI=$CODEC/lmbda0.0483/final.pt; UNET=$DIFF/final.pt; FROZEN=$EXP/step12_guidance/frozen.json
 
 nimg() { case "$1" in text) echo $N_TEXT;; face) echo $N_FACE;; *) echo $N_IMG;; esac; }   # images per evaluation set
-# claim STAGE: with a storage (TS_SYNC) take the stage so no other notebook runs it too; without one there is nobody else.
+# claim STAGE: only with TS_CLAIMS=1 (two notebooks working on the same run repo at once, kaggle_run.py --claims) and a storage (TS_SYNC):
+# take the stage so no other notebook runs it too. Off by default: a single chain of sessions has nobody to protect against, and the claim
+# of a session that was cancelled would otherwise block the stage for 45 minutes.
 claim() {
+  [ "${TS_CLAIMS:-0}" = "1" ] || return 0
   [ -n "${TS_SYNC:-}" ] || return 0
   local r=0
   $PY -m truesight.sync claim --stage "$1" --dir "$EXP" --spec "$TS_SYNC" || r=$?

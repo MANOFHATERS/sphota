@@ -350,6 +350,17 @@ class Syncer:
 DATA_PATTERNS = ["raw/**", "processed/*.txt", "processed/*.csv"]
 
 
+def raw_present(data):
+    """Are the raw training images in <data>/raw? (the split lists data/processed/*.txt come with the git clone, so they prove nothing)"""
+    raw = Path(data) / "raw"
+    if not raw.is_dir():
+        return False
+    for d in raw.iterdir():
+        if d.is_dir() and any(f.is_file() and f.name != ".gitkeep" for f in d.rglob("*")):
+            return True
+    return False
+
+
 def _hf_token(token=None):
     return token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
@@ -374,6 +385,9 @@ def data_pull(repo, local_data, token=None):
         snapshot_download(repo, repo_type="dataset", local_dir=str(local_data), token=_hf_token(token), allow_patterns=DATA_PATTERNS)
     except RepositoryNotFoundError:
         print(f"[sync] dataset {repo} does not exist yet", flush=True)
+        return False
+    if not raw_present(local_data):                                  # a missing repo does not always raise: the local folder is returned
+        print(f"[sync] dataset {repo} holds no images (it does not exist yet, or was never uploaded)", flush=True)
         return False
     print(f"[sync] data restored from dataset {repo}", flush=True)
     return True

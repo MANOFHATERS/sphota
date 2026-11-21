@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 
 from . import runtime
-from .sync import Syncer, data_pull, data_push, release_all
+from .sync import Syncer, data_pull, data_push, raw_present, release_all
 
 DONE, PAUSED, CRASHED, NO_QUOTA = "DONE", "PAUSED", "CRASHED", "NO_QUOTA"
 EXIT_NO_QUOTA = 76                       # not enough weekly GPU quota left to run a useful session
@@ -146,17 +146,6 @@ def link(src, dst, merge=False):
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.symlink_to(src, target_is_directory=True)
     return True
-
-
-def raw_present(data):
-    """Are the raw training images in <data>/raw? (the split lists data/processed/*.txt come with the git clone, so they prove nothing)"""
-    raw = Path(data) / "raw"
-    if not raw.is_dir():
-        return False
-    for d in raw.iterdir():
-        if d.is_dir() and any(f.is_file() and f.name != ".gitkeep" for f in d.rglob("*")):
-            return True
-    return False
 
 
 def prepare_data(root, data_input=None, data_dir=None, data_repo=None):

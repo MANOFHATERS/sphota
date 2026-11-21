@@ -113,11 +113,12 @@ def test_decide_safeguards():
 
 
 # ------------------------------------------------------------------------------------------------ after a session
-def run_after(tmp_path, config, status, argv=None, last=None, push=None, now=None, spec=None):
+def run_after(tmp_path, config, status, argv=None, last=None, push=None, now=None, spec=None, ready=True):
     push = push or FakePush()
     exp = tmp_path / "exp"; exp.mkdir(exist_ok=True)
     action = chain.after_session(config, argv or BASE, status, exp, spec or f"dir:{tmp_path / 'store'}", tmp_path / "k", push=push,
-                                 now=now or utc(2026, 11, 21, 12), last=last or {"gpu": True, "hours_used": 11.0}, log=lambda m: None)
+                                 now=now or utc(2026, 11, 21, 12), last=last or {"gpu": True, "hours_used": 11.0}, log=lambda m: None,
+                                 ready=ready)
     return action, push
 
 
@@ -341,3 +342,20 @@ def test_dataset_restore_is_not_skipped_because_the_clone_contains_train_txt(tmp
     monkeypatch.setattr(kaggle, "data_pull", lambda repo, d: calls.append(repo) or True)
     assert "restored from dataset u/d" in kaggle.prepare_data(root, data_repo="u/d")
     assert calls == ["u/d"]
+
+
+def test_no_handover_to_the_gpu_when_the_data_notebook_downloaded_nothing(tmp_path):
+    action, push = run_after(tmp_path, cfg(kind="cpu_data"), kaggle.DONE, last={"gpu": False, "hours_used": 0.1}, ready=False)
+    assert action == "stop" and push.pushed == []
+    action, push = run_after(tmp_path, cfg(kind="cpu_data"), kaggle.DONE, last={"gpu": False, "hours_used": 2.0}, ready=True)
+    assert action == "gpu" and len(push.pushed) == 1
+
+
+def test_dataset_restore_reports_failure_when_the_repo_has_no_images(tmp_path, monkeypatch):
+    """huggingface_hub returns the local folder instead of raising when the repo does not exist: that is not a success."""
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(tmp_path))
+    assert sync.data_pull("u/missing", tmp_path / "data") is False
+    (tmp_path / "data" / "raw" / "kodak").mkdir(parents=True)
+    (tmp_path / "data" / "raw" / "kodak" / "k.png").write_bytes(b"x")
+    assert sync.data_pull("u/there", tmp_path / "data") is True

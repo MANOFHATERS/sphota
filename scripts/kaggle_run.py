@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--weekly-quota", type=float, default=None, help="your weekly GPU quota (for example 30): the driver counts the hours of the last 7 days itself from a ledger in the run state")
     ap.add_argument("--quota-reset-dow", type=int, default=None, help="weekday of the weekly quota reset, Monday = 0 (UTC): the ledger then counts since the last reset, and a waiter notebook can sleep until it")
     ap.add_argument("--quota-reset-hour", type=int, default=0, help="UTC hour of the weekly quota reset")
+    ap.add_argument("--claims", action="store_true", help="two notebooks work on the same run repo at the same time: claim every stage first so they never run the same one (give them different --stages)")
     ap.add_argument("--no-git-pull", action="store_true")
     ap.add_argument("--no-install", action="store_true")
     ch = ap.add_argument_group("chaining (truesight/chain.py): start the next notebook automatically")
@@ -80,6 +81,8 @@ def main():
         env["STAGES"] = a.stages
     if a.smoke:
         env["SMOKE"] = "1"
+    if a.claims:
+        env["TS_CLAIMS"] = "1"
     reset = None if a.quota_reset_dow is None else (a.quota_reset_dow, a.quota_reset_hour)
     gpu = False if a.chain_kind == "cpu_data" else None
     status, rc = kaggle.run_session(ROOT, a.sync, a.hours, data_input=a.data_input, data_dir=a.data_dir, data_repo=a.data_repo,
@@ -87,8 +90,11 @@ def main():
                                     do_git_pull=not a.no_git_pull, install=not a.no_install, env_extra=env)
     if a.chain:
         from truesight import chain
+        ready = True
+        if a.chain_kind == "cpu_data":                         # hand over to the GPU only if the data really is there
+            ready = kaggle.raw_present(ROOT / "data") and (ROOT / "data" / "processed" / "train.txt").exists()
         chain.after_session(chain_config(a), argv, status, ROOT / "experiments", a.sync,
-                            Path("/kaggle/working/chain_kernels") if Path("/kaggle/working").exists() else ROOT / "chain_kernels")
+                            Path("/kaggle/working/chain_kernels") if Path("/kaggle/working").exists() else ROOT / "chain_kernels", ready=ready)
     sys.exit(rc)
 
 

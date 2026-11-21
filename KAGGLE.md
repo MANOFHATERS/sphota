@@ -175,9 +175,9 @@ training objective (Min-SNR, v-prediction). Splitting decoding and metrics into 
 
 ## Two notebooks on the same run repo
 
-Safe, as long as they do different work: give each its own `STAGES` (`--stages "diffusion"` in one, `--stages "codec_ablation"` in
-the other). Every stage is claimed first (`.running/<stage>.json`, refreshed by each upload, ignored after 45 minutes without a
-refresh), so a stage that is running elsewhere or finished is skipped. A push sends only the files that session changed since its
+Safe, as long as they do different work: pass `--claims` to both and give each its own `STAGES` (`--stages "diffusion"` in one, `--stages "codec_ablation"` in
+the other). With `--claims`, every stage is claimed first (`.running/<stage>.json`, refreshed by each upload, ignored after 45 minutes without a
+refresh; off by default because the claim of a cancelled session would block a single chain for 45 minutes), so a stage that is running elsewhere or finished is skipped. A push sends only the files that session changed since its
 last pull, so a session can never overwrite a newer checkpoint from the other with a stale copy. A stage whose input is made by the
 other notebook waits (exit 75) until it exists. Both notebooks count against the same account quota.
 

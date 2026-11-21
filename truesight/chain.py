@@ -250,7 +250,7 @@ def quota_left_h(cfg, exp_dir, now=None, quota_hours_next=None):
     return b
 
 
-def after_session(cfg, argv, status, exp_dir, spec, workdir, push=push_kernel, now=None, last=None, log=kaggle.log):
+def after_session(cfg, argv, status, exp_dir, spec, workdir, push=push_kernel, now=None, last=None, log=kaggle.log, ready=True):
     """Called by kaggle_run.py when a session has ended and its state is saved. Starts the next notebook if the chain should go on.
     Returns the action taken ("gpu", "cpu_data", "wait" or "stop")."""
     now = time.time() if now is None else now
@@ -258,6 +258,8 @@ def after_session(cfg, argv, status, exp_dir, spec, workdir, push=push_kernel, n
     used = float(last.get("hours_used", 0.0)) if last.get("gpu") or cfg.kind == "cpu_data" else None
     can_wait = cfg.reset is not None and cfg.weekly_quota is not None
     action, why = decide(cfg.kind, status, cfg.count, cfg.max_chain, can_wait, used, stop_requested(spec, exp_dir))
+    if action == "gpu" and cfg.kind == "cpu_data" and not ready:                       # DONE, but nothing was downloaded
+        action, why = "stop", "the data notebook finished but data/raw has no images: not starting the GPU notebook (check the log above)"
     q_next = None
     if cfg.kind == "gpu" and cfg.quota_hours is not None:                  # explicit mode: what is left after this session
         q_next = max(0.0, cfg.quota_hours - float(last.get("hours_used", 0.0)))
