@@ -224,7 +224,7 @@ def test_a_session_with_no_quota_left_does_not_start_and_touches_nothing(tmp_pat
     kaggle.write_ledger_entry(exp, "old", time.time() - 3600 * 40, 30.0)           # a killed 30 h session: the week is used up
     called = tmp_path / "ran"
     status, rc = kaggle.run_session(ROOT, f"dir:{tmp_path / 'store'}", hours=11.5, cmd=_py(f"open({str(called)!r},'w')"), exp_dir=exp,
-                                    do_git_pull=False, install=False, weekly_quota=30)
+                                    do_git_pull=False, install=False, weekly_quota=30, gpu=True)
     assert (status, rc) == (kaggle.NO_QUOTA, kaggle.EXIT_NO_QUOTA) and not called.exists()
 
 
@@ -233,7 +233,7 @@ def test_session_lowers_its_budget_to_the_quota_and_writes_the_ledger(tmp_path):
     exp.mkdir()
     code = "import os; print('LIMIT', os.environ['TS_TIME_LIMIT_HOURS'], os.environ['TS_SAVE_EVERY_MIN'])"
     status, rc = kaggle.run_session(ROOT, f"dir:{store}", hours=11.5, cmd=_py(code), exp_dir=exp, do_git_pull=False, install=False,
-                                    quota_hours=3.0, sync_every=15)
+                                    quota_hours=3.0, sync_every=15, gpu=True)
     assert (status, rc) == (kaggle.DONE, 0)
     (entry,) = kaggle.read_ledger(exp)
     assert entry["reserved_h"] == pytest.approx(2.5) and entry["hours_used"] is not None and entry["hours_used"] < 0.1

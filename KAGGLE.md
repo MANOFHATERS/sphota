@@ -52,6 +52,45 @@ Dataset. Do not expect exactly 2 minutes, expect roughly 3-8.
 The first session also does the one-time work: the 23 GB download from the original dataset sites and its upload to your data repo.
 That first session may end with `PAUSED` before training starts; the data is then ready for all later sessions.
 
+## Automatic restarts (no waiting between sessions)
+
+Everything is saved to Hugging Face by itself (an upload every 15 minutes, a checkpoint about every 9, a final upload when a session ends).
+With `--chain` the **next notebook also starts by itself** when a session ends, using the official `kaggle kernels push` (it makes a new
+version of the notebook and runs it). Three notebooks take part (`truesight/chain.py`):
+
+| Notebook | Accelerator | What it does |
+|---|---|---|
+| `sphota-data` | CPU (uses **no** GPU quota) | downloads and prepares the data, uploads it to your Hugging Face dataset repo, then starts `sphota-train` |
+| `sphota-train` | GPU T4 x2 | trains; when a session pauses at its time budget (state saved) it starts the next `sphota-train` session at once; when everything is done it stops |
+| `sphota-wait` | CPU | started when the weekly GPU quota is used up: sleeps until the quota reset (up to 11 h per notebook, then another waiter), then starts `sphota-train` |
+
+A notebook cannot change its accelerator while it runs, which is why the data step and the training are two notebooks.
+
+**One-time setup**
+1. Kaggle > Settings > API > create a token. Put `KAGGLE_USERNAME` and `KAGGLE_KEY` (or `KAGGLE_API_TOKEN`) in the secrets of each notebook (Add-ons >
+   Secrets), together with `HF_TOKEN` (and `GITHUB_TOKEN` if the repository is private). A secret must be ticked for the notebook that uses it.
+2. On your computer: `pip install kaggle`, put the token in `~/.kaggle/kaggle.json`, then start the chain (PowerShell, one line per command):
+   ```
+   python scripts/kaggle_chain.py start --kind cpu_data --owner YOUR_KAGGLE_USER -- --sync hf:YOU/sphota-run --data-repo YOU/sphota-data --data-dir /kaggle/temp/sphota_data --stages data --weekly-quota 30 --quota-reset-dow 0 --chain
+   ```
+   (In Git Bash put `MSYS_NO_PATHCONV=1` in front, or it rewrites `/kaggle/...`.) `--quota-reset-dow` is the weekday of your quota reset (Monday = 0, UTC);
+   look at the date on the Kaggle quota page. Without it the quota is counted over a rolling 7 days and the waiter cannot be used.
+3. The first time, `sphota-data` has no secrets attached yet and stops at once with "HF_TOKEN not found" (it wastes nothing). Open it in the editor,
+   attach the secrets, **Save Version > Save & Run All** once. The same happens once for `sphota-train` when it is first started by the data notebook:
+   attach its secrets and run it once. After that the notebooks restart themselves. (Whether Kaggle keeps secrets attached across versions pushed
+   by the API is not documented: if a chained start ever fails with "HF_TOKEN not found", attach again and run once more.)
+4. To skip the data step (data already uploaded), start `--kind gpu` instead, without `--stages data`.
+
+**Safeguards.** At most 40 chained starts (`--max-chain`); a crash never chains; a paused session shorter than 6 minutes does not chain (no loops);
+the quota is checked again before every GPU start (the ledger since the last reset, or the explicit `--quota-hours` minus what this session used);
+a push that Kaggle rejects stops the chain without error. **Kill switch:** create an empty file named `.stop_chain` in your Hugging Face run repo (Files >
+Add file) and the chain stops at its next step; `python scripts/kaggle_chain.py stop-help` repeats this. To stop right now, stop the running notebook.
+
+**Not verified here** (it needs a real Kaggle account; the tests replace the kaggle CLI with a recorder): that a running notebook may push another
+notebook, that secrets stay attached across API versions, and that `machine_shape: NvidiaTeslaT4` selects "GPU T4 x2" (a three-year-old kaggle-cli issue
+says so; if the new notebook starts on a P100, change `--machine-shape` or set the accelerator by hand once). Watch the first data-to-GPU handover and check the new notebook's accelerator before leaving it unattended. Both notebooks briefly overlap at a handover (a few
+seconds of double GPU time).
+
 ## Weekly GPU quota (the driver plans around it)
 
 Kaggle ends a session without warning when the weekly GPU quota is used up, and no API tells a notebook how much is left. So the

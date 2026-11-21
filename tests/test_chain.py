@@ -1,0 +1,276 @@
+"""Automatic restarts: notebook files, the next-step decision, the quota-reset arithmetic, the waiter and every safeguard
+(truesight/chain.py, truesight/kaggle.py, scripts/kaggle_chain.py). The kaggle CLI is replaced by a fake that records the pushes."""
+import datetime as dt
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from truesight import chain, kaggle, sync
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ["--sync", "hf:u/r", "--data-repo", "u/d", "--stages", "data", "--weekly-quota", "30", "--quota-reset-dow", "0", "--chain"]
+
+
+def utc(y, mo, d, h=0, mi=0):
+    return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).timestamp()
+
+
+class FakePush:
+    """Records the notebooks that would be pushed (reads them back from the folder, like Kaggle would)."""
+
+    def __init__(self, ok=True):
+        self.ok, self.pushed = ok, []
+
+    def __call__(self, folder):
+        meta = json.loads((Path(folder) / "kernel-metadata.json").read_text())
+        nb = json.loads((Path(folder) / "run.ipynb").read_text())
+        code = "".join(nb["cells"][0]["source"])
+        args = json.loads(eval(code.split("json.loads(", 1)[1].split(")\n", 1)[0]))   # the literal passed to json.loads in the cell
+        self.pushed.append((meta, args))
+        return self.ok, "Kernel version 1 successfully pushed" if self.ok else "error: denied"
+
+
+def cfg(**kw):
+    d = dict(owner="me", kind="gpu", count=0, weekly_quota=30.0, reset=(0, 0), max_chain=40, hours_limit=11.5)
+    d.update(kw)
+    return chain.ChainConfig(**d)
+
+
+def flag(args, name):
+    return args[args.index(name) + 1]
+
+
+# ------------------------------------------------------------------------------------------------ files and arguments
+def test_notebook_files_have_the_right_fields_and_no_secret(tmp_path):
+    for gpu in (True, False):
+        folder = chain.write_kernel(tmp_path / f"k{gpu}", "me", "sphota-train", ["--sync", "hf:u/r"], gpu=gpu)
+        meta = json.loads((folder / "kernel-metadata.json").read_text())
+        assert meta["id"] == "me/sphota-train" and meta["title"] == "sphota train" and meta["code_file"] == "run.ipynb"
+        assert meta["kernel_type"] == "notebook" and meta["enable_internet"] == "true" and meta["is_private"] == "true"
+        assert meta["enable_gpu"] == ("true" if gpu else "false") and (meta.get("machine_shape") == "NvidiaTeslaT4") == gpu
+        nb = json.loads((folder / "run.ipynb").read_text())
+        assert nb["nbformat"] == 4 and nb["cells"][0]["cell_type"] == "code"
+        src = "".join(nb["cells"][0]["source"])
+        compile(src, "run.ipynb", "exec")                                       # the generated cell is valid Python
+        assert "kaggle_run.py" in src and "hf:u/r" in src
+        assert "hf_" not in src.replace("hf:u/r", "") and "KEY" not in src and "get_secret('GITHUB_TOKEN')" in src   # only reads a secret
+    assert "machine_shape" not in chain.kernel_metadata("me", "x", True, machine_shape="")
+
+
+def test_strip_flag_and_next_argv():
+    a = ["--sync", "x", "--quota-hours", "5", "--chain-count=3", "--stages", "data", "--chain-kind", "cpu_data", "--smoke"]
+    assert chain.strip_flag(a, "--quota-hours") == ["--sync", "x", "--chain-count=3", "--stages", "data", "--chain-kind", "cpu_data", "--smoke"]
+    assert chain.strip_flag(a, "--chain-count") == [x for x in a if x != "--chain-count=3"]
+    assert chain.strip_flag(a, "--smoke", has_value=False)[-1] == "cpu_data"
+    n = chain.next_argv(a, "gpu", 4, quota_hours=7.25, drop_stages=True)
+    assert "--stages" not in n and "data" not in n and flag(n, "--quota-hours") == "7.250" and flag(n, "--chain-kind") == "gpu"
+    assert flag(n, "--chain-count") == "4" and n.count("--chain-kind") == 1 and "--smoke" in n and flag(n, "--sync") == "x"
+    w = chain.next_argv(a, "wait", 1, wait_until=1234567890.4)
+    assert flag(w, "--wait-until") == "1234567890" and "--quota-hours" not in w                # stale explicit quota is dropped
+
+
+# ------------------------------------------------------------------------------------------------ quota reset arithmetic
+def test_last_and_next_reset():
+    sat = utc(2026, 11, 21, 12)                                                  # Saturday 21 Nov 2026
+    assert kaggle.last_reset(sat, 0, 0) == utc(2026, 11, 16)                      # Monday 00:00 UTC before it
+    assert kaggle.next_reset(sat, 0, 0) == utc(2026, 11, 23)
+    mon_early = utc(2026, 11, 23, 0, 30)
+    assert kaggle.last_reset(mon_early, 0, 6) == utc(2026, 11, 16, 6)             # today's 06:00 reset has not happened yet
+    assert kaggle.last_reset(utc(2026, 11, 23, 7), 0, 6) == utc(2026, 11, 23, 6)
+    assert kaggle.last_reset(sat, 5, 0) == utc(2026, 11, 21)                      # a Saturday reset, same day
+
+
+def test_ledger_counts_only_since_the_last_reset():
+    now = utc(2026, 11, 24, 3)                                                    # Tuesday 03:00, reset Monday 00:00
+    e = [{"start": utc(2026, 11, 20, 1), "reserved_h": 11.5, "hours_used": 11.0},  # last week: free again after the reset
+         {"start": utc(2026, 11, 23, 5), "reserved_h": 11.5, "hours_used": 11.0}]  # this week: counts
+    assert kaggle.used_quota_hours(e, now, since=kaggle.last_reset(now, 0, 0)) == pytest.approx(11.0)
+    assert kaggle.used_quota_hours(e, now) == pytest.approx(22.0)                 # the rolling 7 days would still count both
+    b, why = kaggle.plan_budget(11.5, weekly_quota=20, entries=e, now=now, reset=(0, 0))
+    assert b == pytest.approx(20 - 11.0 - 0.5) and "since the last weekly reset" in why
+    assert kaggle.plan_budget(11.5, weekly_quota=20, entries=e, now=now)[0] == 0.0           # rolling 7 days: 22 h counted, nothing left
+
+
+# ------------------------------------------------------------------------------------------------ the decision
+@pytest.mark.parametrize("kind,status,can_wait,expect", [
+    ("cpu_data", kaggle.DONE, False, "gpu"), ("cpu_data", kaggle.PAUSED, False, "cpu_data"), ("cpu_data", kaggle.CRASHED, True, "stop"),
+    ("gpu", kaggle.PAUSED, False, "gpu"), ("gpu", kaggle.DONE, True, "stop"), ("gpu", kaggle.CRASHED, True, "stop"),
+    ("gpu", kaggle.NO_QUOTA, True, "wait"), ("gpu", kaggle.NO_QUOTA, False, "stop"),
+])
+def test_decide(kind, status, can_wait, expect):
+    assert chain.decide(kind, status, 0, 40, can_wait)[0] == expect
+
+
+def test_decide_safeguards():
+    assert chain.decide("gpu", kaggle.PAUSED, 39, 40, True)[0] == "gpu" and chain.decide("gpu", kaggle.PAUSED, 40, 40, True)[0] == "stop"
+    assert chain.decide("gpu", kaggle.PAUSED, 0, 40, True, progress_h=0.01)[0] == "stop"          # a pause with no progress never loops
+    assert chain.decide("gpu", kaggle.PAUSED, 0, 40, True, progress_h=5.0)[0] == "gpu"
+    assert chain.decide("gpu", kaggle.PAUSED, 0, 40, True, stopped=True)[0] == "stop"             # kill switch
+
+
+# ------------------------------------------------------------------------------------------------ after a session
+def run_after(tmp_path, config, status, argv=None, last=None, push=None, now=None, spec=None):
+    push = push or FakePush()
+    exp = tmp_path / "exp"; exp.mkdir(exist_ok=True)
+    action = chain.after_session(config, argv or BASE, status, exp, spec or f"dir:{tmp_path / 'store'}", tmp_path / "k", push=push,
+                                 now=now or utc(2026, 11, 21, 12), last=last or {"gpu": True, "hours_used": 11.0}, log=lambda m: None)
+    return action, push
+
+
+def test_gpu_session_that_paused_starts_the_next_gpu_session(tmp_path):
+    action, push = run_after(tmp_path, cfg(count=2, quota_hours=20.0), kaggle.PAUSED)
+    assert action == "gpu" and len(push.pushed) == 1
+    meta, args = push.pushed[0]
+    assert meta["id"] == "me/sphota-train" and meta["enable_gpu"] == "true"
+    assert flag(args, "--chain-count") == "3" and flag(args, "--chain-kind") == "gpu"
+    assert float(flag(args, "--quota-hours")) == pytest.approx(9.0)                # 20 h minus the 11 h this session used
+
+
+def test_data_notebook_hands_over_to_the_gpu_notebook_with_all_stages(tmp_path):
+    action, push = run_after(tmp_path, cfg(kind="cpu_data"), kaggle.DONE, last={"gpu": False, "hours_used": 1.5})
+    assert action == "gpu"
+    meta, args = push.pushed[0]
+    assert meta["id"] == "me/sphota-train" and meta["enable_gpu"] == "true"
+    assert "--stages" not in args and flag(args, "--chain-kind") == "gpu"           # the GPU notebook runs the whole pipeline
+
+
+def test_no_chaining_after_a_crash_or_when_everything_is_done(tmp_path):
+    for status in (kaggle.CRASHED, kaggle.DONE):
+        action, push = run_after(tmp_path, cfg(), status)
+        assert action == "stop" and push.pushed == []
+
+
+def test_out_of_quota_starts_a_cpu_waiter_that_wakes_after_the_reset(tmp_path):
+    now = utc(2026, 11, 21, 12)
+    action, push = run_after(tmp_path, cfg(), kaggle.NO_QUOTA, now=now)
+    assert action == "wait"
+    meta, args = push.pushed[0]
+    assert meta["id"] == "me/sphota-wait" and meta["enable_gpu"] == "false"            # a CPU notebook: no GPU quota while it sleeps
+    assert float(flag(args, "--wait-until")) == pytest.approx(utc(2026, 11, 23, 0, 10))   # Monday 00:00 UTC + 10 minutes
+    action, push = run_after(tmp_path, cfg(reset=None), kaggle.NO_QUOTA)                 # reset unknown: cannot wait
+    assert action == "stop" and push.pushed == []
+
+
+def test_the_quota_is_checked_before_a_start(tmp_path):
+    exp = tmp_path / "exp"; exp.mkdir()
+    kaggle.write_ledger_entry(exp, "s1", utc(2026, 11, 21, 1), 11.5, hours_used=11.2)
+    kaggle.write_ledger_entry(exp, "s2", utc(2026, 11, 20, 1), 11.5, hours_used=11.3)      # 22.5 h used this week
+    kaggle.write_ledger_entry(exp, "s3", utc(2026, 11, 19, 1), 11.5, hours_used=7.0)        # 29.5 h in total, since Monday
+    action, push = run_after(tmp_path, cfg(), kaggle.PAUSED)
+    assert action == "wait" and push.pushed[0][0]["id"] == "me/sphota-wait"
+    action, push = run_after(tmp_path, cfg(reset=None), kaggle.PAUSED)                    # no reset time: stop instead of starting
+    assert action == "stop" and push.pushed == []
+
+
+def test_kill_switch_and_no_progress_and_chain_limit(tmp_path):
+    (tmp_path / "store").mkdir()
+    (tmp_path / "store" / ".stop_chain").write_text("")
+    assert run_after(tmp_path, cfg(), kaggle.PAUSED)[0] == "stop"                         # .stop_chain in the run repo
+    (tmp_path / "store" / ".stop_chain").unlink()
+    assert run_after(tmp_path, cfg(), kaggle.PAUSED, last={"gpu": True, "hours_used": 0.02})[0] == "stop"
+    assert run_after(tmp_path, cfg(count=40), kaggle.PAUSED)[0] == "stop"
+    assert run_after(tmp_path, cfg(), kaggle.PAUSED)[0] == "gpu"                           # and with none of them it goes on
+
+
+def test_a_failed_push_stops_the_chain_without_raising(tmp_path):
+    action, push = run_after(tmp_path, cfg(), kaggle.PAUSED, push=FakePush(ok=False))
+    assert action == "stop"
+
+
+# ------------------------------------------------------------------------------------------------ the waiter
+def test_wait_until_with_a_fake_clock():
+    clock = {"t": 0.0}
+    sleep = lambda s: clock.__setitem__("t", clock["t"] + s)
+    now = lambda: clock["t"]
+    assert chain.wait_until(500.0, max_hours=1, sleep=sleep, now=now, step_s=60) is True and clock["t"] >= 500
+    clock["t"] = 0.0
+    assert chain.wait_until(10 ** 6, max_hours=1, sleep=sleep, now=now, step_s=600) is False and 3600 <= clock["t"] < 4300   # the limit first
+
+
+def test_waiter_starts_the_gpu_notebook_after_the_reset_or_another_waiter(tmp_path):
+    clock = {"t": utc(2026, 11, 21, 12)}
+    sleep = lambda s: clock.__setitem__("t", clock["t"] + s)
+    now = lambda: clock["t"]
+    soon = clock["t"] + 3 * 3600
+    p = FakePush()
+    assert chain.run_wait(cfg(kind="wait", wait_until=soon, count=3), BASE + ["--chain-kind", "wait", "--wait-until", str(soon)],
+                          f"dir:{tmp_path}", tmp_path / "k", push=p, sleep=sleep, now=now, log=lambda m: None) == "gpu"
+    meta, args = p.pushed[0]
+    assert meta["id"] == "me/sphota-train" and "--wait-until" not in args and flag(args, "--chain-count") == "4"
+    far = clock["t"] + 3 * 86400                                                          # reset is days away: wait again
+    p = FakePush()
+    assert chain.run_wait(cfg(kind="wait", wait_until=far), BASE, f"dir:{tmp_path}", tmp_path / "k", push=p, sleep=sleep, now=now,
+                          log=lambda m: None) == "wait"
+    assert p.pushed[0][0]["id"] == "me/sphota-wait" and float(flag(p.pushed[0][1], "--wait-until")) == pytest.approx(far)
+    (tmp_path / ".stop_chain").write_text("")
+    p = FakePush()
+    assert chain.run_wait(cfg(kind="wait", wait_until=clock["t"]), BASE, f"dir:{tmp_path}", tmp_path / "k", push=p, sleep=sleep, now=now,
+                          log=lambda m: None) == "stop" and p.pushed == []
+
+
+# ------------------------------------------------------------------------------------------------ push command, sessions, misc
+def test_push_kernel_command_and_error_handling(tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="Kernel version 3 successfully pushed", stderr="")
+    ok, out = chain.push_kernel(tmp_path, run=fake_run)
+    assert ok and calls[0][:3] == ["kaggle", "kernels", "push"] and calls[0][-2:] == ["-p", str(tmp_path)]
+    assert chain.push_kernel(tmp_path, run=lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="401 Unauthorized"))[0] is False
+    assert chain.push_kernel(tmp_path, run=lambda *a, **k: SimpleNamespace(returncode=0, stdout="Error: bad slug", stderr=""))[0] is False
+
+    def missing(*a, **k):
+        raise FileNotFoundError("kaggle")
+    assert chain.push_kernel(tmp_path, run=missing)[0] is False
+
+
+def test_stop_file_is_synced_and_found(tmp_path):
+    assert sync.wanted(".stop_chain")
+    (tmp_path / "x").mkdir()
+    (tmp_path / "x" / ".stop_chain").write_text("")
+    assert chain.stop_requested(f"dir:{tmp_path / 'x'}") and not chain.stop_requested(f"dir:{tmp_path}")
+
+
+def test_cpu_session_uses_no_quota_and_writes_no_ledger(tmp_path):
+    exp, store = tmp_path / "exp", tmp_path / "store"
+    exp.mkdir()
+    kaggle.write_ledger_entry(exp, "old", kaggle.time.time() - 3600 * 40, 30.0)             # the GPU week is used up ...
+    code = "import os; print('LIMIT', os.environ['TS_TIME_LIMIT_HOURS'])"
+    status, rc = kaggle.run_session(ROOT, f"dir:{store}", hours=11.5, cmd=[sys.executable, "-c", code], exp_dir=exp, do_git_pull=False,
+                                    install=False, weekly_quota=30, gpu=False)
+    assert (status, rc) == (kaggle.DONE, 0)                                                 # ... but a CPU session still runs
+    assert len(kaggle.read_ledger(exp)) == 1 and kaggle.LAST_SESSION["gpu"] is False and kaggle.LAST_SESSION["budget_h"] == 11.5
+
+
+def test_start_script_writes_a_notebook_without_pushing(tmp_path):
+    r = subprocess.run([sys.executable, "scripts/kaggle_chain.py", "start", "--kind", "cpu_data", "--owner", "me", "--workdir", str(tmp_path),
+                        "--write-only", "--", "--sync", "hf:u/r", "--stages", "data"], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    meta = json.loads((tmp_path / "sphota-data" / "kernel-metadata.json").read_text())
+    assert meta["id"] == "me/sphota-data" and meta["enable_gpu"] == "false"
+    src = "".join(json.loads((tmp_path / "sphota-data" / "run.ipynb").read_text())["cells"][0]["source"])
+    assert "--chain-kind" in src and "--chain-owner" in src and "--chain" in src
+    assert subprocess.run([sys.executable, "scripts/kaggle_chain.py", "stop-help"], cwd=ROOT, capture_output=True, text=True).returncode == 0
+
+
+def test_driver_refuses_to_start_without_a_hugging_face_token():
+    import os
+    env = {k: v for k, v in os.environ.items() if k not in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")}
+    r = subprocess.run([sys.executable, "scripts/kaggle_run.py", "--sync", "hf:u/r", "--no-git-pull", "--no-install"], cwd=ROOT, env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0 and "HF_TOKEN not found" in (r.stderr + r.stdout)
+
+
+def test_kaggle_credentials_detection(tmp_path):
+    assert not chain.have_kaggle_credentials({}, home=tmp_path)
+    assert chain.have_kaggle_credentials({"KAGGLE_USERNAME": "u", "KAGGLE_KEY": "k"}, home=tmp_path)
+    assert not chain.have_kaggle_credentials({"KAGGLE_USERNAME": "u"}, home=tmp_path)
+    assert chain.have_kaggle_credentials({"KAGGLE_API_TOKEN": "t"}, home=tmp_path)
+    (tmp_path / ".kaggle").mkdir()
+    (tmp_path / ".kaggle" / "kaggle.json").write_text("{}")
+    assert chain.have_kaggle_credentials({}, home=tmp_path)

@@ -44,6 +44,7 @@ DEFAULT_HOURS = 11.5                     # Kaggle stops at 12 h: the last 30 min
 QUOTA_MARGIN_H = 0.5                     # kept free of the quota for the final upload and for estimate errors
 MIN_USEFUL_H = 0.25                      # below this budget a session cannot even restore the state and save it again
 QUOTA_WINDOW_H = 7 * 24                  # the ledger counts the last 7 days (a rolling week never under-counts a weekly reset)
+LAST_SESSION = {}                        # filled by run_session: session id, start, budget_h, gpu, hours_used, status, rc
 DEFAULT_SYNC_MIN = 15.0                  # upload interval; checkpoints are written more often (see session_env)
 REQUIRED = {                              # import name -> pip name
     "compressai": "compressai", "torchac": "torchac", "lpips": "lpips", "diffusers": "diffusers", "easyocr": "easyocr",
@@ -59,7 +60,19 @@ def log(msg):
     print(f"[kaggle] {msg}", flush=True)
 
 
-def load_kaggle_secrets(names=("HF_TOKEN",)):
+SECRET_NAMES = ("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN", "GITHUB_TOKEN")   # missing ones are simply skipped
+
+
+def has_gpu():
+    """True when this machine has a CUDA GPU (a CPU-only session does not use the weekly GPU quota)."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def load_kaggle_secrets(names=SECRET_NAMES):
     """Copy Kaggle 'Add-ons > Secrets' into environment variables (does nothing outside Kaggle)."""
     try:
         from kaggle_secrets import UserSecretsClient
@@ -188,11 +201,27 @@ def write_ledger_entry(exp, session, start, reserved_h, hours_used=None):
     os.replace(tmp, d / f"{session}.json")
 
 
-def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H):
-    """GPU-session hours spent in the last ``window_h`` hours. A finished session counts its real hours, a session without
-    ``hours_used`` (still running or killed) counts its whole reservation; only the part inside the window counts."""
+def last_reset(now, dow, hour=0):
+    """Epoch seconds of the most recent weekly reset at (weekday ``dow`` with Monday = 0, UTC ``hour``) at or before ``now``."""
+    import datetime as dt
+    t = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+    r = t.replace(hour=int(hour), minute=0, second=0, microsecond=0) - dt.timedelta(days=(t.weekday() - int(dow)) % 7)
+    if r > t:
+        r -= dt.timedelta(days=7)
+    return r.timestamp()
+
+
+def next_reset(now, dow, hour=0):
+    """Epoch seconds of the next weekly reset strictly after ``now`` (same convention as ``last_reset``)."""
+    return last_reset(now, dow, hour) + 7 * 86400.0
+
+
+def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H, since=None):
+    """GPU-session hours spent in the last ``window_h`` hours (or since the epoch time ``since``, the last weekly reset, when given).
+    A finished session counts its real hours, a session without ``hours_used`` (still running or killed) counts its whole
+    reservation; only the part inside the window counts."""
     now = time.time() if now is None else now
-    lo, total = now - window_h * 3600.0, 0.0
+    lo, total = (now - window_h * 3600.0) if since is None else since, 0.0
     for e in entries:
         h = e.get("hours_used")
         h = float(e["reserved_h"] if h is None else h)
@@ -202,23 +231,31 @@ def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H):
     return total
 
 
-def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None, margin_h=QUOTA_MARGIN_H):
-    """(budget in hours, explanation). ``hours`` is the session limit (11.5); the quota only ever lowers it."""
+def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None, margin_h=QUOTA_MARGIN_H, reset=None):
+    """(budget in hours, explanation). ``hours`` is the session limit (11.5); the quota only ever lowers it.
+    ``reset`` = (weekday, utc_hour) of the weekly quota reset (Monday = 0): the ledger then counts only the hours since the last
+    reset instead of the last 7 days (exact, and the quota is full again right after the reset)."""
     budget, why = float(hours), f"session limit {hours} h"
     if quota_hours is not None and quota_hours - margin_h < budget:
         budget, why = quota_hours - margin_h, f"{quota_hours} h of quota left - {margin_h} h margin"
     if weekly_quota is not None:
-        used = used_quota_hours(entries, now)
+        t = time.time() if now is None else now
+        used = used_quota_hours(entries, t, since=None if reset is None else last_reset(t, *reset))
         left = weekly_quota - used - margin_h
         if left < budget:
-            budget, why = left, f"weekly quota {weekly_quota} h - {used:.1f} h used in the last 7 days - {margin_h} h margin"
+            span = "in the last 7 days" if reset is None else "since the last weekly reset"
+            budget, why = left, f"weekly quota {weekly_quota} h - {used:.1f} h used {span} - {margin_h} h margin"
     return max(0.0, budget), why
 
 
 def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_input=None, data_dir=None, data_repo=None,
-                sync_every=DEFAULT_SYNC_MIN, do_git_pull=True, install=True, env_extra=None, quota_hours=None, weekly_quota=None):
+                sync_every=DEFAULT_SYNC_MIN, do_git_pull=True, install=True, env_extra=None, quota_hours=None, weekly_quota=None,
+                gpu=None, reset=None):
     """Run one session. Returns (status, exit code). ``cmd`` defaults to the full pipeline.
-    ``quota_hours`` / ``weekly_quota``: see the module docstring; the budget is lowered to what the quota allows."""
+    ``quota_hours`` / ``weekly_quota`` / ``reset``: see the module docstring; the budget is lowered to what the quota allows.
+    ``gpu``: does this session use the GPU quota? None = detect. A CPU-only session (the data download) uses no quota: it gets the full
+    session limit and writes no ledger entry. ``LAST_SESSION`` describes the session afterwards (used by chain.py)."""
+    LAST_SESSION.clear()
     root = Path(root)
     exp = Path(exp_dir) if exp_dir else root / "experiments"
     start = time.time()
@@ -236,8 +273,13 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
     except Exception as e:                                         # a first session has nothing to pull
         log(f"nothing restored ({type(e).__name__}: {e})")
     hours_limit = hours
-    hours, why = plan_budget(hours_limit, quota_hours, weekly_quota, read_ledger(exp), start)
-    if quota_hours is None and weekly_quota is None:
+    gpu = has_gpu() if gpu is None else gpu
+    if gpu:
+        hours, why = plan_budget(hours_limit, quota_hours, weekly_quota, read_ledger(exp), start, reset=reset)
+    else:
+        why = "CPU-only session: no GPU quota used"
+    LAST_SESSION.update(session=session, start=start, budget_h=hours, gpu=gpu, hours_used=0.0)
+    if gpu and quota_hours is None and weekly_quota is None:
         log("WARNING: no quota given (--quota-hours / --weekly-quota). Kaggle ends a session without warning when the weekly GPU "
             "quota runs out and this driver cannot see it; pass the hours the Kaggle page shows as left.")
     log(f"time budget {hours:.2f} h ({why})")
@@ -246,7 +288,8 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
         return NO_QUOTA, EXIT_NO_QUOTA
     done_before = sorted(p.name for p in (exp / ".done").glob("*")) if (exp / ".done").exists() else []
     log(f"stages already finished: {done_before or 'none'}")
-    write_ledger_entry(exp, session, start, hours)                  # reserve it now: a killed session still counts
+    if gpu:
+        write_ledger_entry(exp, session, start, hours)              # reserve it now: a killed session still counts
     sync.session = session
     try:
         sync.push()
@@ -260,7 +303,10 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
     rc = subprocess.run(cmd, cwd=root, env=env).returncode
     status = classify(rc)
     sync.stop_background()
-    write_ledger_entry(exp, session, start, hours, hours_used=round((time.time() - start) / 3600.0, 4))
+    used = round((time.time() - start) / 3600.0, 4)
+    LAST_SESSION.update(hours_used=used, status=status, rc=rc)
+    if gpu:
+        write_ledger_entry(exp, session, start, hours, hours_used=used)
     release_all(exp, session)                                       # the next session may take over this session's stages at once
     log(f"pipeline ended with status {status} (exit {rc}); saving the run state")
     for attempt in range(3):
@@ -272,7 +318,7 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
                 f"FINAL PUSH FAILED: {e}. The state is still in {exp}; if this is a Kaggle notebook, save the version so /kaggle/working is kept.")
             time.sleep(5 * (attempt + 1))
     if data_repo and (root / "data" / "processed" / "train.txt").exists() and not (exp / ".done" / "data_uploaded").exists() \
-            and not (root / "data").is_symlink() and not (Path(data_input or "x") / "raw").exists():
+            and not (root / "data" / "raw").is_symlink() and not (Path(data_input or "x") / "raw").exists():
         try:                                                       # first session: keep the 23 GB so later sessions restore in minutes
             data_push(data_repo, root / "data")
             (exp / ".done").mkdir(parents=True, exist_ok=True); (exp / ".done" / "data_uploaded").write_text("")

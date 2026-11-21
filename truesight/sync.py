@@ -50,6 +50,8 @@ def wanted(rel, size=None):
         return False
     if size is not None and size > MAX_FILE_GB * 2 ** 30:
         return False
+    if p.name == ".stop_chain":                  # the kill switch of truesight/chain.py: an empty file in the run repo
+        return True
     if p.name in (BASELINE, LOCK):
         return False
     if p.parts and p.parts[0] in (".done", CLAIM_DIR):
