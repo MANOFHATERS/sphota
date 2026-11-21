@@ -359,3 +359,37 @@ def test_dataset_restore_reports_failure_when_the_repo_has_no_images(tmp_path, m
     (tmp_path / "data" / "raw" / "kodak").mkdir(parents=True)
     (tmp_path / "data" / "raw" / "kodak" / "k.png").write_bytes(b"x")
     assert sync.data_pull("u/there", tmp_path / "data") is True
+
+
+# ------------------------------------------------------------------------------------------------ no duplicate GPU sessions
+def test_active_sessions_are_the_unfinished_recently_refreshed_ones():
+    now = 10_000.0
+    e = [{"session": "a", "start": now - 3000, "reserved_h": 11, "hours_used": None, "last_seen": now - 60},     # running
+         {"session": "b", "start": now - 9000, "reserved_h": 11, "hours_used": None, "last_seen": now - 4000},   # killed: not refreshed
+         {"session": "c", "start": now - 3000, "reserved_h": 11, "hours_used": 0.8, "last_seen": now - 60},      # finished
+         {"session": "d", "start": now - 100, "reserved_h": 11, "hours_used": None}]                            # old format: start counts
+    assert [x["session"] for x in kaggle.active_sessions(e, now)] == ["a", "d"]
+
+
+def test_a_second_gpu_session_stops_at_once_and_does_not_chain(tmp_path):
+    exp, store = tmp_path / "exp", tmp_path / "store"
+    exp.mkdir()
+    kaggle.write_ledger_entry(exp, "other", kaggle.time.time() - 600, 11.5)                    # another session started 10 min ago, alive
+    ran = tmp_path / "ran"
+    status, rc = kaggle.run_session(ROOT, f"dir:{store}", hours=11.5, cmd=[sys.executable, "-c", f"open({str(ran)!r},'w')"], exp_dir=exp,
+                                    do_git_pull=False, install=False, weekly_quota=30, gpu=True)
+    assert (status, rc) == (kaggle.BUSY, kaggle.EXIT_BUSY) and not ran.exists()
+    assert chain.decide("gpu", kaggle.BUSY, 0, 40, True)[0] == "stop" and kaggle.classify(77) == kaggle.BUSY
+    assert len(kaggle.read_ledger(exp)) == 1                                                    # it wrote nothing of its own
+
+
+def test_a_dead_session_does_not_block_and_a_running_one_refreshes_its_entry(tmp_path):
+    exp, store = tmp_path / "exp", tmp_path / "store"
+    exp.mkdir()
+    kaggle.write_ledger_entry(exp, "dead", kaggle.time.time() - 7200, 11.5, last_seen=kaggle.time.time() - 3600)   # not refreshed for 1 h
+    code = "import time; time.sleep(2.5)"
+    status, rc = kaggle.run_session(ROOT, f"dir:{store}", hours=11.5, cmd=[sys.executable, "-c", code], exp_dir=exp, do_git_pull=False,
+                                    install=False, weekly_quota=30, gpu=True, heartbeat_s=0.2)
+    assert (status, rc) == (kaggle.DONE, 0)
+    mine = [e for e in kaggle.read_ledger(exp) if e["session"] != "dead"][0]
+    assert mine["hours_used"] is not None and mine["hours_used"] > 0                            # finished: no longer "active"

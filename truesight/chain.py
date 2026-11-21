@@ -194,6 +194,8 @@ def decide(kind, status, count, max_chain, can_wait, progress_h=None, stopped=Fa
         return "stop", f"kill switch: {STOP_FILE} exists in the run repo"
     if count + 1 > max_chain:
         return "stop", f"chain limit reached ({max_chain} chained starts)"
+    if status == kaggle.BUSY:
+        return "stop", "another GPU session of this run is already running: not chaining"
     if status == kaggle.CRASHED:
         return "stop", "the session crashed: not chaining (fix the cause, push, start it by hand)"
     if kind == "cpu_data":

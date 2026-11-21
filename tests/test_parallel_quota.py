@@ -221,7 +221,7 @@ def test_ledger_counts_the_last_week_and_a_killed_session_counts_in_full():
 def test_a_session_with_no_quota_left_does_not_start_and_touches_nothing(tmp_path):
     exp, store = tmp_path / "exp", tmp_path / "store"
     exp.mkdir()
-    kaggle.write_ledger_entry(exp, "old", time.time() - 3600 * 40, 30.0)           # a killed 30 h session: the week is used up
+    kaggle.write_ledger_entry(exp, "old", time.time() - 3600 * 40, 30.0, last_seen=time.time() - 3600 * 40)   # a killed 30 h session: the week is used up
     called = tmp_path / "ran"
     status, rc = kaggle.run_session(ROOT, f"dir:{tmp_path / 'store'}", hours=11.5, cmd=_py(f"open({str(called)!r},'w')"), exp_dir=exp,
                                     do_git_pull=False, install=False, weekly_quota=30, gpu=True)

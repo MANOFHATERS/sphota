@@ -31,6 +31,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -38,8 +39,10 @@ from pathlib import Path
 from . import runtime
 from .sync import Syncer, data_pull, data_push, raw_present, release_all
 
-DONE, PAUSED, CRASHED, NO_QUOTA = "DONE", "PAUSED", "CRASHED", "NO_QUOTA"
+DONE, PAUSED, CRASHED, NO_QUOTA, BUSY = "DONE", "PAUSED", "CRASHED", "NO_QUOTA", "BUSY"
 EXIT_NO_QUOTA = 76                       # not enough weekly GPU quota left to run a useful session
+EXIT_BUSY = 77                           # another GPU session of this run is alive: this one stops at once (no duplicate training)
+ACTIVE_STALE_S = 45 * 60                 # a session whose ledger entry was not refreshed for this long is taken to be dead
 DEFAULT_HOURS = 11.5                     # Kaggle stops at 12 h: the last 30 minutes are for the final upload
 QUOTA_MARGIN_H = 0.5                     # kept free of the quota for the final upload and for estimate errors
 MIN_USEFUL_H = 0.25                      # below this budget a session cannot even restore the state and save it again
@@ -197,7 +200,7 @@ def session_env(spec, hours, start=None, data_repo=None, base=None, sync_every=D
 
 
 def classify(rc):
-    return DONE if rc == 0 else PAUSED if rc == runtime.EXIT_PAUSED else NO_QUOTA if rc == EXIT_NO_QUOTA else CRASHED
+    return DONE if rc == 0 else PAUSED if rc == runtime.EXIT_PAUSED else NO_QUOTA if rc == EXIT_NO_QUOTA else BUSY if rc == EXIT_BUSY else CRASHED
 
 
 # ------------------------------------------------------------------------------------------------ weekly quota ledger
@@ -216,12 +219,20 @@ def read_ledger(exp):
     return out
 
 
-def write_ledger_entry(exp, session, start, reserved_h, hours_used=None):
+def write_ledger_entry(exp, session, start, reserved_h, hours_used=None, last_seen=None):
     d = ledger_dir(exp)
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / f"{session}.json.tmp"
-    tmp.write_text(json.dumps({"session": session, "start": start, "reserved_h": reserved_h, "hours_used": hours_used}))
+    tmp.write_text(json.dumps({"session": session, "start": start, "reserved_h": reserved_h, "hours_used": hours_used,
+                               "last_seen": time.time() if last_seen is None else last_seen}))
     os.replace(tmp, d / f"{session}.json")
+
+
+def active_sessions(entries, now=None, stale_s=ACTIVE_STALE_S):
+    """Ledger entries of GPU sessions that look alive: not finished (no ``hours_used``) and refreshed (``last_seen``) recently. A running
+    session refreshes its entry every minute and uploads it with every sync, so a killed one is taken as dead after ``stale_s``."""
+    now = time.time() if now is None else now
+    return [e for e in entries if e.get("hours_used") is None and now - float(e.get("last_seen", e.get("start", 0))) < stale_s]
 
 
 def last_reset(now, dow, hour=0):
@@ -273,7 +284,7 @@ def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None
 
 def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_input=None, data_dir=None, data_repo=None,
                 sync_every=DEFAULT_SYNC_MIN, do_git_pull=True, install=True, env_extra=None, quota_hours=None, weekly_quota=None,
-                gpu=None, reset=None):
+                gpu=None, reset=None, heartbeat_s=60.0):
     """Run one session. Returns (status, exit code). ``cmd`` defaults to the full pipeline.
     ``quota_hours`` / ``weekly_quota`` / ``reset``: see the module docstring; the budget is lowered to what the quota allows.
     ``gpu``: does this session use the GPU quota? None = detect. A CPU-only session (the data download) uses no quota: it gets the full
@@ -302,6 +313,13 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
     else:
         why = "CPU-only session: no GPU quota used"
     LAST_SESSION.update(session=session, start=start, budget_h=hours, gpu=gpu, hours_used=0.0)
+    if gpu:
+        alive = active_sessions(read_ledger(exp), start)
+        if alive:                                                   # two sessions on one run would train the same stages twice
+            log(f"BUSY: another GPU session of this run is running (started {time.strftime('%H:%M UTC', time.gmtime(alive[0]['start']))}, "
+                f"refreshed {int(start - float(alive[0].get('last_seen', alive[0]['start']))) // 60} min ago): this one stops at once so nothing is "
+                f"trained twice and no quota is wasted. If that session is really dead, run again in {ACTIVE_STALE_S // 60} minutes.")
+            return BUSY, EXIT_BUSY
     if gpu and quota_hours is None and weekly_quota is None:
         log("WARNING: no quota given (--quota-hours / --weekly-quota). Kaggle ends a session without warning when the weekly GPU "
             "quota runs out and this driver cannot see it; pass the hours the Kaggle page shows as left.")
@@ -311,8 +329,17 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
         return NO_QUOTA, EXIT_NO_QUOTA
     done_before = sorted(p.name for p in (exp / ".done").glob("*")) if (exp / ".done").exists() else []
     log(f"stages already finished: {done_before or 'none'}")
+    stop_beat = threading.Event()
     if gpu:
         write_ledger_entry(exp, session, start, hours)              # reserve it now: a killed session still counts
+
+        def beat():                                                 # "I am alive": refreshed every minute, uploaded with every sync
+            while not stop_beat.wait(heartbeat_s):
+                try:
+                    write_ledger_entry(exp, session, start, hours)
+                except OSError:
+                    pass
+        threading.Thread(target=beat, daemon=True).start()
     sync.session = session
     try:
         sync.push()
@@ -326,6 +353,7 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
     rc = subprocess.run(cmd, cwd=root, env=env).returncode
     status = classify(rc)
     sync.stop_background()
+    stop_beat.set()
     used = round((time.time() - start) / 3600.0, 4)
     LAST_SESSION.update(hours_used=used, status=status, rc=rc)
     if gpu:
