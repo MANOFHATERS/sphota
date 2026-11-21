@@ -7,8 +7,8 @@
 #   python scripts/kaggle_run.py --sync hf:USER/REPO   # on Kaggle: restores state, runs, saves state (see KAGGLE.md)
 #
 # Stages, in order:
-#   setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval protect guidance honesty intelligence
-#   codec_ablation ablation_eval train_ablations study_pairs report
+#   setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval clic_crops protect guidance honesty
+#   intelligence codec_ablation ablation_eval train_ablations study_pairs report
 # (codec = the six lambdas; codec_ablation = K=1 and ReLU runs for A1 / A2; train_ablations = A7 / A8; study_pairs builds the
 #  user-study images; the study itself needs people: scripts/user_study_app.py; report = every table and figure.)
 #
@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 PY=${PY:-python}
 DEV=${DEV:-cuda}
 export PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8
-ALL="setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval protect guidance honesty intelligence codec_ablation ablation_eval train_ablations study_pairs report"
+ALL="setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval clic_crops protect guidance honesty intelligence codec_ablation ablation_eval train_ablations study_pairs report"
 STAGES=${STAGES:-$ALL}
 
 # ---- scale: guide values by default, tiny values with SMOKE=1 -------------------------------------------------------------
@@ -31,19 +31,20 @@ if [ "${SMOKE:-0}" = "1" ]; then
   C_BASE=400; C_FT=150;    C_BATCH=4;  C_CROP=128; C_N=32; C_M=48
   D_IT=300;   D_BATCH=8;   D_CROP=128; STEPS=10; MAIN_STEPS=10; D_CH="16 32 32 32"
   U_IT=200;   U_BATCH=8;   U_CH="16 32 32 32"; ABL_IT=100; ABL_BATCH=4; ABL_CH="16 32 32 32"
-  N_IMG=8;    N_TBL=40;    N_HALL=12;  TUNE_N=4; STUDY_IMG=4
+  N_IMG=8;    N_TEXT=8; N_FACE=8; N_TBL=40; N_HALL=12; TUNE_N=4; STUDY_IMG=4; CR_MAX=16; CR_PER=2; CR_BATCH=4; CR_STEPS=4
 else
   EXP=experiments; FIGS=report/figures; RES=report/results; STUDY=study
   AE_IT=30000; AE_BATCH=16; AE_CROP=256
   C_BASE=150000; C_FT=50000; C_BATCH=8; C_CROP=256; C_N=128; C_M=192
   D_IT=200000; D_BATCH=32;  D_CROP=128; STEPS=25; MAIN_STEPS=50; D_CH="64 128 256 256"
   U_IT=20000;  U_BATCH=64;  U_CH="64 128 128 256"; ABL_IT=20000; ABL_BATCH=32; ABL_CH="64 128 256 256"
-  N_IMG=500;   N_TBL=1500;  N_HALL=100; TUNE_N=20; STUDY_IMG=40
+  N_IMG=500;   N_TEXT=300; N_FACE=500; N_TBL=1500; N_HALL=100; TUNE_N=20; STUDY_IMG=40; CR_MAX=2000; CR_PER=20; CR_BATCH=16; CR_STEPS=$MAIN_STEPS
 fi
 mkdir -p "$EXP/.done" "$EXP/logs" "$FIGS" "$RES"
 CODEC=$EXP/step7_codec; DIFF=$EXP/step10_diffusion
 LO=$CODEC/lmbda0.0018/final.pt; HI=$CODEC/lmbda0.0483/final.pt; UNET=$DIFF/final.pt; FROZEN=$EXP/step12_guidance/frozen.json
 
+nimg() { case "$1" in text) echo $N_TEXT;; face) echo $N_FACE;; *) echo $N_IMG;; esac; }   # images per evaluation set
 want() { case " $STAGES " in *" $1 "*) [ ! -e "$EXP/.done/$1" ];; *) return 1;; esac; }
 run()  { local s=$1; shift; echo "=== [$s] $*"; "$@" 2>&1 | tee -a "$EXP/logs/$s.log"; }   # any failure stops the script (set -e + pipefail)
 need() { $PY -m truesight.runtime need "$1" || exit 75; }                                # not enough session time left: pause here
@@ -118,10 +119,16 @@ if want diffusion_eval; then                                    # CFG sweep (A3)
   done_ diffusion_eval
 fi
 
+if want clic_crops; then                                        # LPIPS + FID on ~2,000 matched 256x256 CLIC crops (resumable, keeps its batches)
+  need 60
+  run clic_crops $PY scripts/eval_clic_crops.py --codec "$LO" --diffusion "$UNET" --out "$DIFF/clic_crops" --steps $CR_STEPS       --crops-per-image $CR_PER --max-crops $CR_MAX --batch $CR_BATCH --fid --device $DEV
+  done_ clic_crops
+fi
+
 if want protect; then                                           # Step 11: ROI coding, TFR / FIR on the text and face sets
   for S in text face; do
     need 30
-    run protect $PY scripts/eval_protect.py --set $S --limit $N_IMG --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" \
+    run protect $PY scripts/eval_protect.py --set $S --limit $(nimg $S) --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" \
         --steps $STEPS --tfr --fir --device $DEV --figs "$FIGS" --out "$EXP/step11_protect/$S"
   done
   done_ protect
@@ -133,7 +140,7 @@ if want guidance; then                                          # Step 12: tune 
       --steps $MAIN_STEPS --tfr --fir --device $DEV --out "$EXP/step12_guidance"
   for S in text face kodak clic; do
     need 30
-    run guidance $PY scripts/eval_sphota.py --set $S --limit $N_IMG --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" \
+    run guidance $PY scripts/eval_sphota.py --set $S --limit $(nimg $S) --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" \
         --frozen "$FROZEN" --steps $MAIN_STEPS --tfr --fir --device $DEV --figs "$FIGS" --out "$EXP/step12_guidance/eval_$S"
   done
   done_ guidance
@@ -183,6 +190,7 @@ fi
 if want report; then                                            # every table and figure from the evaluation outputs
   run report $PY scripts/eval_faithfulness.py --exp "$EXP" --out "$RES" --figs "$FIGS"
   run report $PY scripts/make_figures.py --exp "$EXP" --out "$RES" --figs "$FIGS" --study "$STUDY"
+  run report $PY scripts/build_report.py --results "$RES" --out "$RES/../report.md"
   done_ report
 fi
 

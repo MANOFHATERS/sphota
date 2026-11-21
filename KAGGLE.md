@@ -52,8 +52,8 @@ That first session may end with `PAUSED` before training starts; the data is the
 
 ## What runs, in order (resume-able stages)
 
-`setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval protect guidance honesty intelligence codec_ablation
-ablation_eval train_ablations study_pairs report`. Run a subset with `--stages "diffusion diffusion_eval"`; try everything with tiny
+`setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval clic_crops protect guidance honesty intelligence
+codec_ablation ablation_eval train_ablations study_pairs report`. Run a subset with `--stages "diffusion diffusion_eval"`; try everything with tiny
 settings first with `--smoke` (about 15 minutes of GPU). Each finished stage is uploaded immediately.
 
 ## Honest limits
@@ -64,7 +64,9 @@ settings first with `--smoke` (about 15 minutes of GPU). Each finished stage is 
 * **Resume is exact in state, not bit-identical in data order.** Weights, optimiser, EMA and the step counter come back exactly;
   the random crops after a restart are drawn with a seed that depends on the step, so the run is statistically the same as an
   uninterrupted one but not byte-for-byte identical.
-* **A stage that is not a trainer restarts from its beginning if it is cut off**, for example an evaluation that needs 40 minutes
+* **Check the evaluation time before the long run:** `python scripts/benchmark_decode.py` prints the projected hours of every evaluation
+  stage on your GPU (see CLOUD_RUNBOOK.md, 4b). Evaluation images are capped at 768 x 512 pixels per image for this reason.
+* **A stage that is not a trainer restarts from its beginning if it is cut off** (the CLIC crop stage is the exception: it keeps its batches), for example an evaluation that needs 40 minutes
   and is interrupted at minute 39. The driver avoids this by not starting a stage when too little session time is left.
 * **If the whole Kaggle kernel is killed** (not the Python process), the last upload can be up to 30 minutes old.
 * **Kaggle limits change** (session length, quota, disk, scheduled runs). Re-check them before a long run.

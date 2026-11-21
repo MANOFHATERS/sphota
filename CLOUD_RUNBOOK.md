@@ -54,7 +54,8 @@ Exit status 75 means "paused at the time budget, run again" (only when `TS_TIME_
 | codec_eval, bitstream | Steps 7-8 | RD curves, BD-rate, MS-SSIM, LPIPS; real `.sphota` files, bit-exact check |
 | step9 | Step 9 | unconditional 64x64 DDPM (20k iterations): forward-process figure, sample grid |
 | diffusion | Step 10 | conditional U-Net, 200k iterations, batch 32, EMA 0.999 |
-| diffusion_eval | Step 10, A3, A6 | CFG and steps sweeps, LPIPS / PSNR / FID |
+| diffusion_eval | Step 10, A3, A6 | CFG and steps sweeps, LPIPS / PSNR on Kodak (24 images) |
+| clic_crops | Step 10, section 3.4 | LPIPS and FID on about 2,000 matched 256x256 CLIC crops (resumable; the guide's FID target is measured here) |
 | protect | Step 11 | Text Faithfulness Rate and Face Identity Rate with protected regions |
 | guidance | Step 12, A4, A5 | tune once on val, freeze, evaluate once on the test sets |
 | honesty | Step 13 | eight hallucination detectors, AUROC, learning curves, safe mode |
@@ -64,9 +65,28 @@ Exit status 75 means "paused at the time budget, run again" (only when `TS_TIME_
 | study_pairs | 8.5 | the images of the user study |
 | report | Week 11 | `report/results/` (summary table of the section 3.4 targets, ablation table, faithfulness table, provenance) and `report/figures/` |
 
+## 4b. Plan the evaluation cost first (2 minutes, before the long run)
+
+The U-Net has attention at 1/4 resolution, so the cost of decoding grows with the square of the image size, and the guidance of
+Step 12 needs the whole image at once. The evaluation scripts therefore replace an image larger than `--max-pixels` (default
+768 x 512, a Kodak image) by the window that covers the most text / faces, and the original used for every metric is that same
+window (nothing is resized). `--max-pixels 0` decodes whole images, which is only sensible on a strong GPU.
+
+```bash
+python scripts/benchmark_decode.py --diffusion experiments/step10_diffusion/final.pt     # after training; or without --diffusion for a first estimate
+```
+
+It times one U-Net call on your GPU and prints hours per evaluation stage for the full-scale settings. If the total is more than you
+can afford, lower the limits (text 300 and face 500 images, 20 tuning images, 2,000 crops, 50 / 25 DDIM steps) in the SMOKE / full
+blocks at the top of `scripts/run_full_pipeline.sh`.
+
 ## 5. After the run
 
 - `experiments/logs/*.log`: one log per stage; `report/results/summary_table.md`: each of the eight targets as MET / NOT MET / not measured.
+- `report/report.md` (from `scripts/build_report.py`): the report skeleton with the course-mapping table, all result tables, the limitations
+  derived from what was missed and the list of deviations from the guide filled in; the narrative chapters are marked TODO(author).
+  `report/weekly_log.md` is the table where a missed target gets its real number and reason. Tags: `bash scripts/tag_week.sh 1` ...
+  `eval-freeze`, `v1.0`.
 - **User study** (needs 10 or more people): `python scripts/user_study_app.py --study study --port 8000`, participants open the page; then
   `python scripts/analyse_user_study.py` (preference and noticed-change rates with 95% intervals). `make_figures.py` includes it.
 - **Freeze, then regenerate:** after the evaluations, `git tag eval-freeze` on a clean commit, then
@@ -82,5 +102,6 @@ Exit status 75 means "paused at the time budget, run again" (only when `TS_TIME_
 - **First contact with real models:** the guidance learning rate depends on the trained codec, so `guidance` tunes it on the
   validation split first. If a decode diverges or a number misses the guide's target, expect to adjust settings (for example `--w`,
   the learning rate, more diffusion iterations) and re-run that stage only.
+- Evaluation images above 768 x 512 pixels are evaluated on a window of that size (see 4b); CLIC test labels are not public.
 - The A7 / A8 runs are 20k iterations each, much shorter than the 200k main run, so only their comparison to each other is meaningful.
 - Report writing, slides, the demo video and the git tags of the weekly plan are yours; the code only produces the numbers and tables.
