@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
+from truesight import eval_limits  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from PIL import Image  # noqa: E402
@@ -118,6 +119,7 @@ def main():
     ap.add_argument("--test-frac", type=float, default=0.3)
     ap.add_argument("--encoder-boxes", action="store_true")
     ap.add_argument("--tfr", action="store_true")
+    eval_limits.add_argument(ap)
     ap.add_argument("--out", default=str(ROOT / "experiments" / "step13_honesty"))
     ap.add_argument("--figs", default=str(ROOT / "report" / "figures"))
     ap.add_argument("--device", default="cpu")
@@ -141,9 +143,8 @@ def main():
 
     rows, per_image = [], []
     for idx, path in enumerate(files):
-        pil = Image.open(path).convert("RGB")
+        pil, planned, text, faces, _ = eval_limits.limit_and_detect(Image.open(path).convert("RGB"), td, fd, a.max_pixels)
         x = to_t(pil).to(dev)
-        planned, text, faces = roi.find_protected_boxes(pil, td, fd)
         detected = text + faces
         boxes = planned if a.with_roi else []
         blob, _ = roi.encode_protected(lo, hi, x, boxes)

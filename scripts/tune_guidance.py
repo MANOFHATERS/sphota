@@ -31,6 +31,7 @@ from truesight.diffusion.schedule import Schedule  # noqa: E402
 from truesight.diffusion.train_diffusion import load_unet  # noqa: E402
 from truesight.metrics import lpips_dist, psnr  # noqa: E402
 from truesight.protect import roi  # noqa: E402
+from truesight import eval_limits  # noqa: E402
 from truesight.protect.detect import FaceDetector, TextDetector  # noqa: E402
 
 PROC = ROOT / "data" / "processed"
@@ -60,6 +61,7 @@ def main():
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--tfr", action="store_true")
     ap.add_argument("--fir", action="store_true")
+    eval_limits.add_argument(ap)
     ap.add_argument("--no-roi", action="store_true", help="tune without protected boxes")
     ap.add_argument("--out", default=str(ROOT / "experiments" / "step12_guidance"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -81,8 +83,8 @@ def main():
 
     items = []
     for path in read_list(a.list)[: a.limit]:
-        pil = Image.open(path).convert("RGB")
-        boxes = [] if a.no_roi else roi.find_protected_boxes(pil, td, fd)[0]
+        pil, boxes, _, _, _ = eval_limits.limit_and_detect(Image.open(path).convert("RGB"), td, fd, a.max_pixels)
+        boxes = [] if a.no_roi else boxes
         blob, _ = roi.encode_protected(lo, hi, to_t(pil).to(dev), boxes)
         items.append((pil, roi.decode_protected(lo, hi, blob)))
     print(f"{len(items)} validation images, {sum(1 for _, p in items if p.boxes)} with protected boxes", flush=True)

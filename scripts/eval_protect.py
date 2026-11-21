@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
+from truesight import eval_limits  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
@@ -85,6 +86,7 @@ def main():
     ap.add_argument("--w", type=float, default=1.5)
     ap.add_argument("--tfr", action="store_true")
     ap.add_argument("--fir", action="store_true")
+    eval_limits.add_argument(ap)
     ap.add_argument("--out", default=str(ROOT / "experiments" / "step11_protect"))
     ap.add_argument("--figs", default=str(ROOT / "report" / "figures"))
     ap.add_argument("--device", default="cpu")
@@ -107,9 +109,8 @@ def main():
 
     rows, decodes, seam_items, seam_boxes = [], {"original": [], "coarse": [], "coarse+roi": [], "diffusion": [], "diffusion+roi": []}, [], {}
     for path in files:
-        pil = Image.open(path).convert("RGB")
+        pil, boxes, text, faces, _ = eval_limits.limit_and_detect(Image.open(path).convert("RGB"), text_det, face_det, a.max_pixels)
         W, H = pil.size
-        boxes, text, faces = roi.find_protected_boxes(pil, text_det, face_det)
         row = dict(image=Path(path).name, H=H, W=W, n_text=len(text), n_faces=len(faces), n_boxes=len(boxes),
                    area_fraction=roi.box_area_fraction(boxes, H, W))
         if a.draw:

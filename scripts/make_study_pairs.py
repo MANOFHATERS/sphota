@@ -23,7 +23,7 @@ import torch  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from PIL import Image  # noqa: E402
-from truesight import runtime  # noqa: E402
+from truesight import eval_limits, runtime  # noqa: E402
 from truesight.baselines.jpeg import find_quality_for_bpp  # noqa: E402
 from truesight.codec.train_codec import load_codec  # noqa: E402
 from truesight.data import read_list  # noqa: E402
@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--images", type=int, default=40, help="images in the pool (taken round-robin from the lists)")
     ap.add_argument("--w", type=float, default=None)
     ap.add_argument("--steps", type=int, default=None)
+    eval_limits.add_argument(ap)
     ap.add_argument("--salt", default="study")
     ap.add_argument("--out", default=str(ROOT / "study"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -81,10 +82,9 @@ def main():
                 files.append(p[i])
     rows, pairs_csv = [], out / "pairs.csv"
     for n, path in enumerate(files):
-        pil = Image.open(path).convert("RGB")
+        pil, boxes, _, _, _ = eval_limits.limit_and_detect(Image.open(path).convert("RGB"), td, fd, a.max_pixels)
         W, H = pil.size
         x = to_t(pil).to(dev)
-        boxes = roi.find_protected_boxes(pil, td, fd)[0]
         blob, _ = roi.encode_protected(lo, hi, x, boxes)
         prot = roi.decode_protected(lo, hi, blob)
         bpp = 8 * len(blob) / (W * H)

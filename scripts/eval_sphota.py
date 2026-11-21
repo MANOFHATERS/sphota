@@ -37,6 +37,7 @@ from truesight.diffusion.schedule import Schedule  # noqa: E402
 from truesight.diffusion.train_diffusion import load_unet  # noqa: E402
 from truesight.metrics import lpips_dist, psnr  # noqa: E402
 from truesight.protect import roi  # noqa: E402
+from truesight import eval_limits  # noqa: E402
 from truesight.protect.detect import FaceDetector, TextDetector  # noqa: E402
 
 PROC = ROOT / "data" / "processed"
@@ -103,6 +104,7 @@ def main():
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--tfr", action="store_true")
     ap.add_argument("--fir", action="store_true")
+    eval_limits.add_argument(ap)
     ap.add_argument("--hist-images", type=int, default=4, help="images used for the L_bin figure")
     ap.add_argument("--out", default=str(ROOT / "experiments" / "step12_guidance" / "eval"))
     ap.add_argument("--figs", default=str(ROOT / "report" / "figures"))
@@ -131,8 +133,7 @@ def main():
     originals, decodes, rows = [], {m: [] for m in METHODS}, []
     hist_plain, hist_guided = [], []
     for i, path in enumerate(files):
-        pil = Image.open(path).convert("RGB")
-        boxes = roi.find_protected_boxes(pil, td, fd)[0]
+        pil, boxes, _, _, _ = eval_limits.limit_and_detect(Image.open(path).convert("RGB"), td, fd, a.max_pixels)
         x = to_t(pil).to(dev)
         blob, _ = roi.encode_protected(lo, hi, x, boxes)
         prot = roi.decode_protected(lo, hi, blob)
