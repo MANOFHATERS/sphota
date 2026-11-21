@@ -19,7 +19,8 @@ TARGET_COLUMNS = ["target", "requirement", "measured", "met", "source", "note"]
 
 # where each evaluation script writes (relative to the experiments folder)
 PATHS = dict(
-    codec="step7_codec", bitstream="step8_bitstream", diffusion="step10_diffusion/eval", ablation="step10_ablation",
+    codec="step7_codec", bitstream="step8_bitstream", diffusion="step10_diffusion/eval", clic_crops="step10_diffusion/clic_crops",
+    ablation="step10_ablation",
     protect="step11_protect", guidance="step12_guidance", honesty="step13_honesty", intelligence="step14_intelligence",
 )
 
@@ -100,19 +101,25 @@ def collect_targets(exp):
                                                 "needs all six lambda codecs evaluated"))
 
     # 2. LPIPS >= 25% lower than the VAE codec alone (same bits) and 3. FID below JPEG, WebP and the codec
-    s10 = load_json(exp / PATHS["diffusion"] / "summary.json")
+    s10, sc = load_json(exp / PATHS["diffusion"] / "summary.json"), load_json(exp / PATHS["clic_crops"] / "summary.json")
     red = _num(_get(s10, "checks", "lpips_reduction_pct"))
-    rows.append(_row("LPIPS vs VAE codec alone", ">= 25% lower", f"{red:.1f}% lower", red >= 25, "step10_diffusion/eval/summary.json")
+    red_clic = _num(_get(sc, "checks", "lpips_reduction_pct"))
+    note = f"CLIC crops ({_get(sc, 'crops')}): {red_clic:.1f}% lower" if red_clic is not None else "CLIC crop LPIPS not measured"
+    rows.append(_row("LPIPS vs VAE codec alone", ">= 25% lower", f"{red:.1f}% lower (Kodak)", red >= 25,
+                     "step10_diffusion/eval/summary.json", note)
                 if red is not None else _missing("LPIPS vs VAE codec alone", ">= 25% lower", "step10_diffusion/eval/summary.json"))
-    fid = _get(s10, "fid")
-    if isinstance(fid, dict) and "diffusion" in fid:
-        txt = ", ".join(f"{k} {v:.1f}" for k, v in fid.items())
-        rows.append(_row("FID on CLIC crops", "below JPEG, WebP and the VAE codec", txt,
-                         _get(s10, "checks", "fid_beats_jpeg_webp_coarse"), "step10_diffusion/eval/summary.json",
-                         _get(s10, "fid_note") or ""))
+    # FID: the guide measures it on about 2,000 CLIC crops; the 24-image Kodak FID is only a fallback and is labelled as such
+    for src, label in ((sc, "step10_diffusion/clic_crops/summary.json"), (s10, "step10_diffusion/eval/summary.json")):
+        fid = _get(src, "fid")
+        if isinstance(fid, dict) and "diffusion" in fid:
+            txt = ", ".join(f"{k} {v:.1f}" for k, v in fid.items())
+            on = f"{_get(src, 'crops')} CLIC crops" if src is sc else "Kodak, 24 images (not the guide's CLIC crops)"
+            rows.append(_row("FID on CLIC crops", "below JPEG, WebP and the VAE codec", f"{txt} [{on}]",
+                             _get(src, "checks", "fid_beats_jpeg_webp_coarse"), label, _get(src, "fid_note") or ""))
+            break
     else:
-        rows.append(_missing("FID on CLIC crops", "below JPEG, WebP and the VAE codec", "step10_diffusion/eval/summary.json",
-                             "run eval_diffusion.py with --fid"))
+        rows.append(_missing("FID on CLIC crops", "below JPEG, WebP and the VAE codec", "step10_diffusion/clic_crops/summary.json",
+                             "run scripts/eval_clic_crops.py --fid"))
 
     # 4. TFR >= 2x plain diffusion (text set), 5. FIR >= 1.5x plain diffusion (face set)
     for tname, kind, key, mult, setname in (("Text Faithfulness Rate", "tfr", "tfr", 2.0, "text"),

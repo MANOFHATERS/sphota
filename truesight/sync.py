@@ -10,7 +10,7 @@ A Kaggle session has a 12-hour limit and its disk is wiped afterwards, so the ru
     python -m truesight.sync data-push --data-repo user/sphota-data      # once: upload data/raw + split lists
     python -m truesight.sync data-pull --data-repo user/sphota-data      # every new session: restore them in minutes
 
-Only run state is stored: *.pt, *.csv, *.json, *.png, *.log, *.txt, *.md and the .done/ stage markers (no *.tmp files, nothing
+Only run state is stored: *.pt, *.csv, *.json, *.png, *.npz, *.log, *.txt, *.md and the .done/ stage markers (no *.tmp files, nothing
 larger than ``MAX_FILE_GB``). ``Syncer.start_background`` pushes every few minutes while training, so even a hard kill loses
 little. Pull only fetches files that are missing or older locally; push only sends files that changed.
 """
@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-KEEP_SUFFIXES = {".pt", ".csv", ".json", ".png", ".log", ".txt", ".md", ".yaml"}
+KEEP_SUFFIXES = {".pt", ".csv", ".json", ".png", ".log", ".txt", ".md", ".yaml", ".npz"}
 MAX_FILE_GB = 4.0
 
 
@@ -31,7 +31,7 @@ def wanted(rel, size=None):
     p = Path(rel)
     if p.name.endswith(".tmp") or ".tmp" in p.suffixes:
         return False
-    if any(part in ("__pycache__", ".cache") for part in p.parts):
+    if any(part in ("__pycache__", ".cache", "fid") for part in p.parts):         # fid/ = rebuilt PNG folders, thousands of files
         return False
     if size is not None and size > MAX_FILE_GB * 2 ** 30:
         return False
@@ -110,7 +110,7 @@ class Syncer:
             return 0
         patterns = [f"**/*{s}" for s in sorted(KEEP_SUFFIXES)] + [f"*{s}" for s in sorted(KEEP_SUFFIXES)] + [".done/*"]
         api.upload_folder(folder_path=str(self.local), repo_id=self.target, repo_type="model", allow_patterns=patterns,
-                          ignore_patterns=["*.tmp", "**/*.tmp", "**/__pycache__/*"],
+                          ignore_patterns=["*.tmp", "**/*.tmp", "**/__pycache__/*", "**/fid/*", "fid/*"],
                           commit_message=f"Run state at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
         if squash:                                    # old checkpoint versions would otherwise pile up in the repo
             try:
