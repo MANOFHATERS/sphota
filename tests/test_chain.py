@@ -285,3 +285,59 @@ def test_cli_is_upgraded_once_only_for_the_new_token_type():
     assert calls[0][1:4] == ["-m", "pip", "install"] and "kaggle" in calls[0]
     assert chain.ensure_cli({"KAGGLE_API_TOKEN": "KGAT_x"}, run=fake) is False and len(calls) == 1   # only once
     chain._CLI_READY["done"] = False
+
+
+def _fresh_clone(root):
+    """What a git clone of the repository leaves in data/: tracked placeholder and split-list files."""
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / ".gitkeep").write_text("")
+    (root / "data" / "processed").mkdir()
+    (root / "data" / "processed" / ".gitkeep").write_text("")
+    (root / "data" / "processed" / "train.txt").write_text("data/raw/div2k_train/images/0001.png\n")
+
+
+def test_data_dir_works_on_a_fresh_clone_with_tracked_data_files(tmp_path):
+    """The bug that filled /kaggle/working: data/ was not empty after the clone, so --data-dir was silently ignored."""
+    root, big = tmp_path / "proj", tmp_path / "temp" / "sphota_data"
+    _fresh_clone(root)
+    try:
+        msg = kaggle.prepare_data(root, data_dir=big)
+    except OSError:
+        pytest.skip("symlinks are not allowed on this machine")
+    assert "data ->" in msg and (root / "data").is_symlink()
+    assert (big / "processed" / "train.txt").read_text().startswith("data/raw/div2k_train")      # the tracked file was kept (merged)
+    (root / "data" / "raw" / "kodak").mkdir()                                                    # writes through data/ land in the big folder
+    (root / "data" / "raw" / "kodak" / "a.png").write_bytes(b"x")
+    assert (big / "raw" / "kodak" / "a.png").exists()
+    assert kaggle.prepare_data(root, data_dir=big).startswith("data ->")                          # running again is fine
+
+
+def test_existing_files_in_the_big_folder_win_over_the_clone(tmp_path):
+    root, big = tmp_path / "proj", tmp_path / "big"
+    _fresh_clone(root)
+    (big / "processed").mkdir(parents=True)
+    (big / "processed" / "train.txt").write_text("restored\n")
+    try:
+        kaggle.prepare_data(root, data_dir=big)
+    except OSError:
+        pytest.skip("symlinks are not allowed on this machine")
+    assert (big / "processed" / "train.txt").read_text() == "restored\n"
+
+
+def test_raw_present_ignores_the_split_lists_and_placeholders(tmp_path):
+    root = tmp_path / "proj"
+    _fresh_clone(root)
+    assert not kaggle.raw_present(root / "data")                              # lists + .gitkeep prove nothing
+    (root / "data" / "raw" / "kodak").mkdir()
+    assert not kaggle.raw_present(root / "data")
+    (root / "data" / "raw" / "kodak" / "k.png").write_bytes(b"x")
+    assert kaggle.raw_present(root / "data")
+
+
+def test_dataset_restore_is_not_skipped_because_the_clone_contains_train_txt(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    _fresh_clone(root)
+    calls = []
+    monkeypatch.setattr(kaggle, "data_pull", lambda repo, d: calls.append(repo) or True)
+    assert "restored from dataset u/d" in kaggle.prepare_data(root, data_repo="u/d")
+    assert calls == ["u/d"]

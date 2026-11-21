@@ -116,18 +116,47 @@ def git_pull(root):
     return out[-1] if out else "ok"
 
 
-def link(src, dst):
-    """dst -> src (symlink), replacing an empty dst folder; leaves a non-empty real dst alone."""
+def _only_placeholders(d):
+    """True if the folder holds nothing but .gitkeep files (what a fresh git clone leaves in data/raw)."""
+    return all(p.name == ".gitkeep" for p in Path(d).rglob("*") if p.is_file())
+
+
+def link(src, dst, merge=False):
+    """dst -> src (symlink). An empty folder (or one with only .gitkeep files) is replaced. A folder with real content is left
+    alone, unless ``merge``: then its files that are missing in ``src`` are copied there first (a fresh clone of the repository
+    already contains data/processed/*.txt and .gitkeep files, which must not stop the link), and the folder is replaced."""
+    import shutil
     src, dst = Path(src), Path(dst)
     if dst.is_symlink():
         dst.unlink()
     elif dst.exists():
-        if any(dst.iterdir()):
+        if _only_placeholders(dst):
+            shutil.rmtree(dst)
+        elif merge:
+            src.mkdir(parents=True, exist_ok=True)
+            for f in dst.rglob("*"):
+                if f.is_file():
+                    t = src / f.relative_to(dst)
+                    if not t.exists():
+                        t.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, t)
+            shutil.rmtree(dst)
+        else:
             return False
-        dst.rmdir()
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.symlink_to(src, target_is_directory=True)
     return True
+
+
+def raw_present(data):
+    """Are the raw training images in <data>/raw? (the split lists data/processed/*.txt come with the git clone, so they prove nothing)"""
+    raw = Path(data) / "raw"
+    if not raw.is_dir():
+        return False
+    for d in raw.iterdir():
+        if d.is_dir() and any(f.is_file() and f.name != ".gitkeep" for f in d.rglob("*")):
+            return True
+    return False
 
 
 def prepare_data(root, data_input=None, data_dir=None, data_repo=None):
@@ -135,14 +164,19 @@ def prepare_data(root, data_input=None, data_dir=None, data_repo=None):
 
     data_input  folder of an attached Kaggle dataset that contains raw/ (and optionally processed/): linked, instant
     data_dir    a roomy scratch folder (Kaggle: /kaggle/temp/...) that becomes <root>/data, because /kaggle/working holds 20 GB
-    data_repo   Hugging Face dataset repo uploaded earlier with ``python -m truesight.sync data-push``: downloaded if missing
+    data_repo   Hugging Face dataset repo uploaded earlier with ``python -m truesight.sync data-push``: downloaded if the raw images are missing
     With none of them the pipeline's own ``data`` stage downloads the datasets from their original sources (slow, once)."""
     root, data = Path(root), Path(root) / "data"
     notes = []
     if data_dir:
         Path(data_dir).mkdir(parents=True, exist_ok=True)
-        if link(data_dir, data):
-            notes.append(f"data -> {data_dir}")
+        if link(data_dir, data, merge=True):
+            import shutil
+            free = shutil.disk_usage(data_dir).free / 2 ** 30
+            notes.append(f"data -> {data_dir} ({free:.0f} GB free there)" + ("  WARNING: less than ~30 GB free: the datasets need about 23 GB, "
+                                                                           "the image cache up to 41 GB more" if free < 30 else ""))
+        else:
+            raise RuntimeError(f"could not link {data} to {data_dir}: it is a real folder with files and could not be merged")
     if data_input and (Path(data_input) / "raw").exists():
         (data).mkdir(parents=True, exist_ok=True)
         if link(Path(data_input) / "raw", data / "raw"):
@@ -151,7 +185,7 @@ def prepare_data(root, data_input=None, data_dir=None, data_repo=None):
             import shutil
             shutil.copytree(Path(data_input) / "processed", data / "processed", dirs_exist_ok=True)
             notes.append("processed lists copied")
-    elif data_repo and not (data / "processed" / "train.txt").exists():
+    elif data_repo and not raw_present(data):
         if data_pull(data_repo, data):
             notes.append(f"restored from dataset {data_repo}")
     return "; ".join(notes) or "no data source given: the data stage downloads from the original sources"
@@ -317,7 +351,7 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
             log(f"final push failed ({type(e).__name__}: {e}); retrying" if attempt < 2 else
                 f"FINAL PUSH FAILED: {e}. The state is still in {exp}; if this is a Kaggle notebook, save the version so /kaggle/working is kept.")
             time.sleep(5 * (attempt + 1))
-    if data_repo and (root / "data" / "processed" / "train.txt").exists() and not (exp / ".done" / "data_uploaded").exists() \
+    if data_repo and raw_present(root / "data") and not (exp / ".done" / "data_uploaded").exists() \
             and not (root / "data" / "raw").is_symlink() and not (Path(data_input or "x") / "raw").exists():
         try:                                                       # first session: keep the 23 GB so later sessions restore in minutes
             data_push(data_repo, root / "data")
