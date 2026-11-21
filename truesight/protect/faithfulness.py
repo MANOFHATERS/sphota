@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image
 
 from ..metrics import cer, cosine
-from .detect import _as_pil, _as_rgb_array
+from .detect import ImageMemo, _as_pil, _as_rgb_array
 
 MIN_OCR_CONF = 0.5
 MAX_CER = 0.05
@@ -31,6 +31,7 @@ class EasyOCRAdapter:
 
     def __init__(self, langs=("en",), gpu=False, reader=None):
         self.langs, self.gpu, self._reader = list(langs), gpu, reader
+        self._memo = ImageMemo()                              # the original image is read once, not once per method
 
     @property
     def reader(self):
@@ -40,11 +41,15 @@ class EasyOCRAdapter:
         return self._reader
 
     def read(self, img):
-        out = []
-        for poly, text, conf in self.reader.readtext(_as_rgb_array(img)):
-            pts = np.asarray(poly, dtype=float)
-            out.append(((pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()), text, float(conf)))
-        return out
+        a = _as_rgb_array(img)
+
+        def run():
+            out = []
+            for poly, text, conf in self.reader.readtext(a):
+                pts = np.asarray(poly, dtype=float)
+                out.append(((pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()), text, float(conf)))
+            return out
+        return self._memo.get(ImageMemo.key(a), run)
 
     def recognize(self, img, box):
         a = _as_rgb_array(img)
@@ -60,6 +65,7 @@ class FaceEmbedder:
 
     def __init__(self, device="cpu", model=None):
         self.device, self._model = device, model
+        self._memo = ImageMemo()                              # the original's face crops are embedded once, not once per method
 
     @property
     def model(self):
@@ -69,6 +75,10 @@ class FaceEmbedder:
         return self._model
 
     def embed(self, pil):
+        pil = pil.convert("RGB")
+        return self._memo.get(ImageMemo.key(np.asarray(pil)), lambda: self._embed(pil))
+
+    def _embed(self, pil):
         import torch
         x = torch.from_numpy(np.asarray(pil.convert("RGB").resize((160, 160), Image.BILINEAR), dtype=np.float32))
         x = ((x - 127.5) / 128.0).permute(2, 0, 1)[None].to(self.device)           # facenet "fixed standardisation"

@@ -135,7 +135,7 @@ class SphotaOutput:
 
 
 def sphota_decode(codec_lo, codec_hi, unet, sched, blob=None, prot=None, w=1.5, steps=50, seed=0, guided=True,
-                  use_roi=True, feather=roi_mod.FEATHER, tile=None, track_only=False, **guide_kw):
+                  use_roi=True, feather=roi_mod.FEATHER, tile=None, track_only=False, prefix=None, **guide_kw):
     """The full Sphoṭa decoder: decompress the file -> coarse image (bit-exact latent) -> (guided) DDIM with
     classifier-free guidance -> feathered paste of the protected regions.
 
@@ -145,6 +145,9 @@ def sphota_decode(codec_lo, codec_hi, unet, sched, blob=None, prot=None, w=1.5, 
     guided=False, use_roi=False is plain diffusion decoding from the same bits.
     track_only  with guided=False: attach a measure-only guide (no modification) so ``output.guide.history`` holds the
                 L_bin of the unguided decode at every step, for the "L_bin along the denoising steps" figure.
+    prefix      a sample.PrefixCache of this file: the variants (plain / ROI / guided, different guidance settings) share the denoising
+                steps before their guidance starts, so they are computed once (same result as decoding from scratch). Ignored for
+                ``track_only`` decodes, which need every step.
     ``guide_kw`` goes to FaithfulGuide (alpha, beta, inner_steps, lr, t_start, margin, normalize). Returns SphotaOutput.
     """
     if prot is None:
@@ -160,7 +163,8 @@ def sphota_decode(codec_lo, codec_hi, unet, sched, blob=None, prot=None, w=1.5, 
         canvas = pad_to_size(prot.canvas, Hp, Wp).to(dev) if have_roi else None
         mask = pad_to_size(prot.mask, Hp, Wp).to(dev) if have_roi else None
         guide = FaithfulGuide(codec_lo, prot.y_hat.to(dev), canvas, mask, **guide_kw)
-    x01 = diffusion_decode(unet, sched, prot.coarse, steps=steps, w=w, seed=seed, guide=guide, tile=tile)
+    x01 = diffusion_decode(unet, sched, prot.coarse, steps=steps, w=w, seed=seed, guide=guide, tile=tile,
+                           prefix=None if track_only else prefix)
     x = roi_mod.paste(x01, prot.canvas.to(dev), prot.soft_mask.to(dev)) if have_roi else x01
     return SphotaOutput(x=x.clamp(0, 1), x_diffusion=x01, coarse=prot.coarse, guide=guide, prot=prot,
                         boxes=prot.boxes if have_roi else [])

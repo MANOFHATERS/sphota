@@ -96,6 +96,44 @@ With one GPU everything runs one after the other, in the same order. If one job 
 no work is lost. Each job writes only its own folders; its console output goes to `experiments/logs/job_<name>.out`. Whether a "T4 x2"
 session costs one or two sessions of quota is something to check on your account after the first run: look at the quota counter.
 
+## Round two: more speed with the same data, models and quality
+
+Based on the research report (`reports/Faster training without quality loss.md`). Nothing here reduces data, iterations or model size.
+What can change numerics is **off until a parity check passed**.
+
+**Always on (exact or float noise only):**
+- **Tiled cache.** The decoded-image cache is stored as 128 x 128 tiles (a crop touches at most 4 contiguous tiles instead of 128 scattered
+  row reads) and memory-mapped with `MADV_RANDOM`, because 41 GB does not fit in the ~29 GB of RAM and part of every read goes to the disk.
+  Same pixels, same crops (tests compare to the PNG path). An old (untiled) cache is rebuilt automatically.
+- **Flip and float conversion on the GPU.** The loader returns uint8 crops (4x less host-to-device traffic, no float work on the busy CPU
+  cores); the trainer converts and flips each sample with probability 0.5 on the GPU. Same distribution.
+- **Fused Adam / AdamW** (`TS_FUSED_OPTIM=0` to turn off), pinned memory and `prefetch_factor=4` (`TS_PREFETCH`).
+- **Data-wait meter.** Every log line of `train_codec` / `train_diffusion` ends with `data-wait N%`: the share of time the GPU waited for a
+  batch. Near 0%: the loader is fine. Above ~15%: the run is data-bound. `scripts/profile_train.py` prints a DATA-BOUND / GPU-BOUND verdict.
+- **Evaluation reuse (exact):** the plain / ROI-only / guided decodes of one image share the denoising steps before their guidance starts
+  (`PrefixCache`; `tune_guidance.py` and `eval_sphota.py` use it), the first denoising step is shared across the CFG-scale and step-count
+  sweeps (`FirstStepCache`), and OCR / face-detector / face-embedding results of the unchanged original are computed once instead of once per
+  method. Tests check that every reused decode equals the from-scratch decode.
+
+**Only after a parity check (otherwise everything stays fp32 exactly as in the guide):**
+- **fp16 codec convolutions** (`TS_CODEC_AMP`, default `auto` in the pipeline). The plain convolutions run in fp16; GDN, the last layer of every
+  stack (so the latent that is rounded, the mixture parameters and the reconstruction keep fp32 precision), the entropy model, likelihoods, rate,
+  MSE and the auxiliary loss stay fp32, with a loss scaler that counts skipped steps. Run `STAGES=amp_parity` once (about an hour: fp32 vs fp16,
+  2 seeds each, Kodak-quality evaluation in fp32). It writes `experiments/amp_parity.json`; `amp_ok` is true only if the PSNR / bpp differences
+  are within the seed-to-seed spread, no more than 1% of steps were skipped and nothing went non-finite. It also prints the measured speed-up. If
+  it fails, training stays fp32 automatically. The research found no published rate-distortion evidence either way, so for the final decision
+  also compare a half-length (75k) run at one lambda (`train_codec --amp 1` against `--amp 0`).
+- **fp16 U-Net decoding and batched guidance passes** (`TS_EVAL_AMP`, `TS_EVAL_BATCH_CFG`, default `auto`). The `eval_parity` stage (5-10 minutes,
+  in the default run, before the evaluation) decodes a few images with the fp32 reference and the candidates and enables each only if it matches
+  (PSNR >= 60 dB for the batched passes; for fp16: >= 35 dB and 10 dB above the seed-to-seed difference, paired LPIPS change <= 0.01).
+  The bin-consistency guidance itself (the gradient steps through the codec encoder) always stays fp32.
+- **fp16 frozen codec inside diffusion training** (`TS_COND_AMP=1`, default off): it can round a latent differently from the fp32 decoder that
+  makes the same image at test time, so it is never enabled automatically.
+
+**Deliberately not done** (the research found no gain or a risk): `torch.compile` (0-10% typical, regressions on T4, changes the RNG stream),
+CUDA graphs, DDP across the two T4s (slower than independent jobs in the only Kaggle measurement), gradient accumulation, changes to the
+training objective (Min-SNR, v-prediction). Splitting decoding and metrics into separate stages saves no GPU time by itself, so it was not built.
+
 ## Two notebooks on the same run repo
 
 Safe, as long as they do different work: give each its own `STAGES` (`--stages "diffusion"` in one, `--stages "codec_ablation"` in

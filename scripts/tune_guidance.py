@@ -27,6 +27,7 @@ from truesight.codec.train_codec import load_codec  # noqa: E402
 from truesight.data import read_list  # noqa: E402
 from truesight.diffusion.eval_guidance import choose_guidance_config  # noqa: E402
 from truesight.diffusion.guidance import consistency_rate, sphota_decode  # noqa: E402
+from truesight.diffusion.sample import PrefixCache  # noqa: E402
 from truesight.diffusion.schedule import Schedule  # noqa: E402
 from truesight.diffusion.train_diffusion import load_unet  # noqa: E402
 from truesight.metrics import lpips_dist, psnr  # noqa: E402
@@ -89,10 +90,12 @@ def main():
         items.append((pil, roi.decode_protected(lo, hi, blob)))
     print(f"{len(items)} validation images, {sum(1 for _, p in items if p.boxes)} with protected boxes", flush=True)
 
+    prefixes = [PrefixCache() for _ in items]      # one per image: the grid settings share the steps before their guidance starts
+
     def evaluate(**kw):
         rows, pairs = [], []
-        for pil, prot in items:
-            o = sphota_decode(lo, hi, unet, sched, prot=prot, w=a.w, steps=a.steps, **kw)
+        for (pil, prot), prefix in zip(items, prefixes):
+            o = sphota_decode(lo, hi, unet, sched, prot=prot, w=a.w, steps=a.steps, prefix=prefix, **kw)
             x = to_t(pil).to(dev)
             rows.append(dict(consistency=consistency_rate(lo, o.x, prot.y_hat), lpips=lpips_dist(x.cpu(), o.x.cpu()),
                              psnr=psnr(x.cpu(), o.x.cpu())))

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from .. import runtime, speed
 from ..codec.train_codec import load_codec
-from ..data import CropDataset
+from ..data import CropDataset, to_float_batch
 from .decode import coarse_decode
 from .schedule import Schedule
 from .unet import CHANNELS, make_unet, unet_config
@@ -102,8 +102,9 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
     ema = copy.deepcopy(unet).eval().requires_grad_(False)
     if use_cl:
         speed.to_channels_last(unet, ema)                         # the checkpoint format (state_dict values) is unchanged
-    opt = (torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=weight_decay) if optimizer == "adamw"
-           else torch.optim.Adam(unet.parameters(), lr=lr))
+    fused = speed.fused_ok(device)                                # one fused kernel for the optimiser step: same update rule
+    opt = (torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=weight_decay, fused=fused) if optimizer == "adamw"
+           else torch.optim.Adam(unet.parameters(), lr=lr, fused=fused))
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     step, last = 0, out / "last.pt"
     if last.exists():                                              # resume
@@ -113,9 +114,10 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
         seed_all(seed + step)
         print(f"resumed from step {step}", flush=True)
 
-    loader = torch.utils.data.DataLoader(CropDataset(train_list or ROOT / "data" / "processed" / "train.txt", crop),
+    loader = torch.utils.data.DataLoader(CropDataset(train_list or ROOT / "data" / "processed" / "train.txt", crop, raw=True),
                                          batch_size=batch, shuffle=True, num_workers=workers, drop_last=True,
-                                         persistent_workers=workers > 0)
+                                         persistent_workers=workers > 0, **speed.loader_kwargs(workers, device))
+    meter = speed.WaitMeter()                                     # how long the GPU waits for data (see the log line)
 
     def stream():
         while True:
@@ -142,7 +144,9 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
             cur_lr = lr if lr_schedule == "constant" else lr_at(step, iters, warmup, lr)
             for g in opt.param_groups:
                 g["lr"] = cur_lr
-            x = next(batches).to(device, non_blocking=True)
+            with meter:
+                raw = next(batches)
+            x = to_float_batch(raw, device)                        # uint8 -> float and the random flip, on the GPU
             x0 = x * 2 - 1                                         # images in [-1, 1]
             c = coarse_decode(codec, x) * 2 - 1                    # condition in [-1, 1] (rounded-latent decode)
             c = drop_condition(c, p_drop)                          # null condition (zeros) for CFG
@@ -164,7 +168,9 @@ def train_diffusion(codec_path, out, iters=200_000, batch=32, crop=128, lr=1e-4,
             step += 1
             if step % log_every == 0:
                 w.writerow([step, loss.item(), cur_lr]); logf.flush()
-                print(f"step {step}/{iters} loss {loss.item():.4f} lr {cur_lr:.2e} {time.time() - t0:.0f}s", flush=True)
+                print(f"step {step}/{iters} loss {loss.item():.4f} lr {cur_lr:.2e} {time.time() - t0:.0f}s "
+                      f"data-wait {meter.fraction():.0%}", flush=True)
+                meter.reset()
             if step % ckpt_every == 0 or step == stop or guard.save_due():
                 save()
             if step < stop:

@@ -36,7 +36,7 @@ export PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8
 export TS_SESSION_ID=${TS_SESSION_ID:-$(date +%s)-$$}      # identifies this run in the stage claims (kaggle_run.py sets it)
 # shellcheck source=scripts/chains.sh
 source scripts/chains.sh
-ALL="setup data baselines ae codec codec_eval bitstream step9 diffusion diffusion_eval clic_crops protect guidance honesty intelligence codec_ablation ablation_eval train_ablations study_pairs report"
+ALL="setup data baselines ae codec codec_eval bitstream step9 diffusion eval_parity diffusion_eval clic_crops protect guidance honesty intelligence codec_ablation ablation_eval train_ablations study_pairs report"
 STAGES=${STAGES:-$ALL}
 
 # ---- GPUs: how many chains can run side by side --------------------------------------------------------------------------
@@ -48,20 +48,25 @@ WORKERS=$(( NGPU > 1 ? 2 : 4 ))          # data-loader processes per trainer (a 
 # ---- scale: guide values by default, tiny values with SMOKE=1 -------------------------------------------------------------
 if [ "${SMOKE:-0}" = "1" ]; then
   EXP=experiments_smoke; FIGS=report_smoke/figures; RES=report_smoke/results; STUDY=study_smoke
-  AE_IT=300;  AE_BATCH=8;  AE_CROP=128
+  AE_IT=300;  AE_BATCH=8;  AE_CROP=128; AMP_IT=100
   C_BASE=400; C_FT=150;    C_BATCH=4;  C_CROP=128; C_N=32; C_M=48
   D_IT=300;   D_BATCH=8;   D_CROP=128; STEPS=10; MAIN_STEPS=10; D_CH="16 32 32 32"
   U_IT=200;   U_BATCH=8;   U_CH="16 32 32 32"; ABL_IT=100; ABL_BATCH=4; ABL_CH="16 32 32 32"
   N_IMG=8;    N_TEXT=8; N_FACE=8; N_TBL=40; N_HALL=12; TUNE_N=4; STUDY_IMG=4; CR_MAX=16; CR_PER=2; CR_BATCH=4; CR_STEPS=4
 else
   EXP=experiments; FIGS=report/figures; RES=report/results; STUDY=study
-  AE_IT=30000; AE_BATCH=16; AE_CROP=256
+  AE_IT=30000; AE_BATCH=16; AE_CROP=256; AMP_IT=3000
   C_BASE=150000; C_FT=50000; C_BATCH=8; C_CROP=256; C_N=128; C_M=192
   D_IT=200000; D_BATCH=32;  D_CROP=128; STEPS=25; MAIN_STEPS=50; D_CH="64 128 256 256"
   U_IT=20000;  U_BATCH=64;  U_CH="64 128 128 256"; ABL_IT=20000; ABL_BATCH=32; ABL_CH="64 128 256 256"
   N_IMG=500;   N_TEXT=300; N_FACE=500; N_TBL=1500; N_HALL=100; TUNE_N=20; STUDY_IMG=40; CR_MAX=2000; CR_PER=20; CR_BATCH=16; CR_STEPS=$MAIN_STEPS
 fi
 mkdir -p "$EXP/.done" "$EXP/logs" "$FIGS" "$RES"
+# Speed-ups that are used only after a parity check passed (they read these result files; without them everything stays fp32 as in the
+# guide): fp16 codec convolutions after `STAGES=amp_parity` (scripts/amp_parity.py), fp16 / batched U-Net decoding after the eval_parity stage.
+export TS_AMP_PARITY_FILE=${TS_AMP_PARITY_FILE:-$PWD/$EXP/amp_parity.json}
+export TS_EVAL_PARITY_FILE=${TS_EVAL_PARITY_FILE:-$PWD/$EXP/eval_parity.json}
+export TS_CODEC_AMP=${TS_CODEC_AMP:-auto} TS_EVAL_AMP=${TS_EVAL_AMP:-auto} TS_EVAL_BATCH_CFG=${TS_EVAL_BATCH_CFG:-auto}
 CODEC=$EXP/step7_codec; DIFF=$EXP/step10_diffusion
 LO=$CODEC/lmbda0.0018/final.pt; HI=$CODEC/lmbda0.0483/final.pt; UNET=$DIFF/final.pt; FROZEN=$EXP/step12_guidance/frozen.json
 
@@ -167,6 +172,23 @@ stage_diffusion() {
     run diffusion $PY -m truesight.diffusion.train_diffusion --codec "$LO" --out "$DIFF" \
         --iters $D_IT --batch $D_BATCH --crop $D_CROP --channels $D_CH --workers $WORKERS
     done_ diffusion
+  fi
+}
+
+stage_eval_parity() {
+  if want eval_parity; then                                       # does fp16 / batched U-Net decoding give the same decodes? (5-10 min)
+    need 15
+    require "$UNET" diffusion
+    run eval_parity $PY scripts/eval_parity.py --codec "$LO" --diffusion "$UNET" --out "$EXP/eval_parity.json" --device $DEV
+    done_ eval_parity
+  fi
+}
+
+stage_amp_parity() {
+  if want amp_parity; then                                        # fp16 codec convolutions vs fp32: short A/B (not in the default run)
+    need 90
+    run amp_parity $PY scripts/amp_parity.py --out "$EXP/amp_parity" --iters $AMP_IT --batch $C_BATCH --crop $C_CROP --N $C_N --M $C_M         --workers $WORKERS --device $DEV
+    done_ amp_parity
   fi
 }
 
@@ -324,6 +346,7 @@ chain_post_b()           { stage_guidance; stage_honesty; stage_study_pairs; sta
 stage_setup
 stage_data
 ensure_cache
+stage_amp_parity                                                 # only when requested (STAGES=amp_parity); decides TS_CODEC_AMP=auto
 if phase_train; then
   stage_codec; stage_codec_ablation                              # their runs are finished: this only writes the done-markers
 else
@@ -331,6 +354,7 @@ else
   stage_codec
   run_chains chain_diffusion chain_train_side
 fi
+stage_eval_parity                                                # decides TS_EVAL_AMP / TS_EVAL_BATCH_CFG = auto for the evaluation
 run_chains chain_post_a chain_post_b
 stage_report
 

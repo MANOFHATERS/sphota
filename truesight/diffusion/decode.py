@@ -10,14 +10,23 @@ overlaps with linear ramps.
 """
 import torch
 
+from .. import speed
 from ..codec.bitstream import pad_to_multiple
 from .sample import ddim_sample
 
 
 @torch.no_grad()
-def coarse_decode(codec, x):
+def coarse_decode(codec, x, amp=None):
     """The condition: g_s(round(g_a(x))) clamped to [0, 1] - exactly the image the receiver gets from the bitstream
-    without any generative step. x: (B, 3, H, W) in [0, 1], H and W multiples of 64."""
+    without any generative step. x: (B, 3, H, W) in [0, 1], H and W multiples of 64.
+
+    ``amp`` (default: TS_COND_AMP, off): run the frozen codec's convolutions in fp16 (fp32 GDN and last layers, see
+    TrueSightCodec._seq). Faster, but the rounded latent can land in a different integer at a bin boundary than the fp32 decoder
+    that makes the same image at test time, so it is off unless you decide otherwise."""
+    use = speed.cond_amp_enabled(x.device) if amp is None else bool(amp) and x.device.type == "cuda"
+    if use and hasattr(codec, "_seq"):
+        y = codec._seq(codec.g_a, x, amp=True)
+        return codec._seq(codec.g_s, torch.round(y), amp=True).clamp(0, 1)
     return codec.g_s(torch.round(codec.g_a(x))).clamp(0, 1)
 
 
@@ -46,10 +55,12 @@ def _ramp(n, overlap, left, right, device):
 
 @torch.no_grad()
 def diffusion_decode(unet, sched, coarse, steps=50, w=1.5, seed=0, guide=None, tile=None, overlap=32, multiple=64,
-                     eta=0.0):
+                     eta=0.0, prefix=None, first_step=None, amp=None, batch_cfg=None):
     """coarse: (B, 3, H, W) in [0, 1] (any size; it is edge-padded to a multiple of ``multiple`` and cropped back).
     Returns the decoded image in [0, 1]. ``tile`` (a multiple of 8) enables tiled decoding of a padded image larger
-    than one tile; a ``guide`` hook is only supported for whole-image decoding."""
+    than one tile; a ``guide`` hook is only supported for whole-image decoding.
+    ``prefix`` (sample.PrefixCache) and ``first_step`` (sample.FirstStepCache) reuse work shared with other decodes of the same
+    file (whole-image decoding only); ``amp`` / ``batch_cfg`` select fp16 and the batched guidance passes (see ddim_sample)."""
     B, _, H, W = coarse.shape
     cp = pad_to_multiple(coarse, multiple)
     Hp, Wp = cp.shape[-2:]
@@ -58,7 +69,8 @@ def diffusion_decode(unet, sched, coarse, steps=50, w=1.5, seed=0, guide=None, t
     g.manual_seed(seed)
     x_T = torch.randn(c.shape, generator=g, device=c.device)               # one noise field for the whole image
     if tile is None or (Hp <= tile and Wp <= tile):
-        x = ddim_sample(unet, sched, c, steps=steps, w=w, guide=guide, seed=seed, eta=eta, x_T=x_T)
+        x = ddim_sample(unet, sched, c, steps=steps, w=w, guide=guide, seed=seed, eta=eta, x_T=x_T, amp=amp, batch_cfg=batch_cfg,
+                        prefix=prefix, first_step=first_step)
     else:
         if guide is not None:
             raise NotImplementedError("guidance hooks are only supported for whole-image decoding (tile=None)")
@@ -70,7 +82,7 @@ def diffusion_decode(unet, sched, coarse, steps=50, w=1.5, seed=0, guide=None, t
             for x0 in xs:
                 th, tw = min(tile, Hp), min(tile, Wp)
                 sl = (slice(None), slice(None), slice(y0, y0 + th), slice(x0, x0 + tw))
-                out = ddim_sample(unet, sched, c[sl], steps=steps, w=w, seed=seed, eta=eta, x_T=x_T[sl])
+                out = ddim_sample(unet, sched, c[sl], steps=steps, w=w, seed=seed, eta=eta, x_T=x_T[sl], amp=amp, batch_cfg=batch_cfg)
                 wy = _ramp(th, overlap, y0 > 0, y0 + th < Hp, c.device)
                 wx = _ramp(tw, overlap, x0 > 0, x0 + tw < Wp, c.device)
                 wt = (wy[:, None] * wx[None, :])[None, None]

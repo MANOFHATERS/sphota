@@ -10,6 +10,7 @@ Writes <out>/log.csv (it, loss, bpp, mse, aux) and <out>/final.pt (weights + con
 """
 import argparse
 import csv
+import os
 import random
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ import numpy as np
 import torch
 
 from .. import runtime, speed
-from ..data import CropDataset
+from ..data import CropDataset, to_float_batch
 from .vae_codec import TrueSightCodec, rd_loss
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,27 +67,34 @@ def _resize_buffers(net, state):
 
 def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256, lr=1e-4, aux_lr=1e-3, clip=1.0,
                 ckpt_every=5000, log_every=100, workers=4, seed=0, train_list=None, init_from=None, device=None,
-                stop_at=None, act="gdn"):
+                stop_at=None, act="gdn", amp=None):
     """Train (or resume) one codec. ``stop_at`` stops early after saving, used to test resume. Returns the net.
-    ``act`` is "gdn" or "relu" (ablation A2). Raises ``runtime.Paused`` after saving when the session time budget is used up,
+    ``act`` is "gdn" or "relu" (ablation A2). ``amp``: fp16 convolutions with fp32 GDN / entropy model / loss (see TrueSightCodec._seq);
+    None = decided by TS_CODEC_AMP (default off = pure fp32; "auto" = only after scripts/amp_parity.py passed). Raises ``runtime.Paused`` after saving when the session time budget is used up,
     and writes last.pt before re-raising if anything crashes, so the run always continues from where it stopped."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     seed_all(seed)
     speed.setup(device)                                           # cudnn.benchmark (fixed crop size): only changes speed
     net = TrueSightCodec(N=N, M=M, K=K, act=act).to(device)
-    use_cl = speed.use_channels_last("codec", device, amp=False)  # off by default: the codec trains in fp32 (see truesight/speed.py)
+    use_amp = speed.codec_amp_enabled(device) if amp is None else (bool(amp) and device.type == "cuda")
+    net.amp, net._amp_skipped = use_amp, 0
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)         # loss scaling for the fp16 convolutions (no-op when amp is off)
+    use_cl = speed.use_channels_last("codec", device, amp=use_amp)  # off by default: pure fp32 has no Tensor-Core use for channels_last
     if use_cl:
         speed.to_channels_last(net.g_a, net.g_s, net.h_a)
     main_params, aux_params = net.split_parameters()
-    opt = torch.optim.Adam(main_params, lr=lr)
-    aux_opt = torch.optim.Adam(aux_params, lr=aux_lr)
+    fused = speed.fused_ok(device)                                 # one fused kernel for the optimiser step: same update rule
+    opt = torch.optim.Adam(main_params, lr=lr, fused=fused)
+    aux_opt = torch.optim.Adam(aux_params, lr=aux_lr, fused=fused)
     it = 0
     last = out / "last.pt"
     if last.exists():                                              # resume
         s = torch.load(last, map_location=device)
         net.load_state_dict(_resize_buffers(net, s["net"])); opt.load_state_dict(s["opt"])
         aux_opt.load_state_dict(s["aux"]); it = s["it"]
+        if use_amp and "scaler" in s:
+            scaler.load_state_dict(s["scaler"])
         seed_all(seed + it)
         print(f"[lmbda={lmbda}] resumed from iteration {it}", flush=True)
     elif init_from:                                                # fine-tune: weights only, fresh optimisers
@@ -96,9 +104,10 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
         net.load_state_dict(_resize_buffers(net, s["net"]))
         print(f"[lmbda={lmbda}] initialised from {init_from}", flush=True)
 
-    loader = torch.utils.data.DataLoader(CropDataset(train_list or ROOT / "data" / "processed" / "train.txt", crop),
+    loader = torch.utils.data.DataLoader(CropDataset(train_list or ROOT / "data" / "processed" / "train.txt", crop, raw=True),
                                          batch_size=batch, shuffle=True, num_workers=workers, drop_last=True,
-                                         persistent_workers=workers > 0)
+                                         persistent_workers=workers > 0, **speed.loader_kwargs(workers, device))
+    meter = speed.WaitMeter()                                      # how long the GPU waits for data (see the log line)
 
     def stream():
         while True:
@@ -117,23 +126,33 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
     guard = runtime.guard()
 
     def save():                                                    # reads the loop's current ``it`` and weights
-        _atomic_save({"net": net.state_dict(), "opt": opt.state_dict(), "aux": aux_opt.state_dict(), "it": it,
-                      "config": model_config(net, lmbda)}, last)
+        state = {"net": net.state_dict(), "opt": opt.state_dict(), "aux": aux_opt.state_dict(), "it": it,
+                 "config": model_config(net, lmbda)}
+        if use_amp:
+            state["scaler"] = scaler.state_dict()
+        _atomic_save(state, last)
         guard.saved()
 
     with runtime.crash_safe(save, f"lmbda={lmbda}", lambda: runtime.finite_params(net)):
         while it < stop:
             for g in opt.param_groups:
                 g["lr"] = lr_at(it, iters, lr)
-            x = speed.cl(next(batches).to(device, non_blocking=True), use_cl)
+            with meter:
+                raw = next(batches)
+            x = speed.cl(to_float_batch(raw, device), use_cl)      # uint8 -> float and the random flip, on the GPU
             out_ = net(x)                                          # entropy model stays float32 (no autocast)
             loss, bpp, mse = rd_loss(out_, x, lmbda)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at iteration {it}: loss={loss.item()} bpp={bpp.item()}")
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            scale_before = scaler.get_scale() if use_amp else 1.0
+            scaler.scale(loss).backward()                          # plain loss.backward() when amp is off
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(main_params, clip)
-            opt.step()
+            scaler.step(opt)                                       # skipped by the scaler when a fp16 gradient overflowed
+            scaler.update()
+            if use_amp and scaler.get_scale() < scale_before:
+                net._amp_skipped += 1
             aux = net.aux_loss()
             aux_opt.zero_grad(set_to_none=True)
             aux.backward()
@@ -142,12 +161,15 @@ def train_codec(lmbda, out, K=3, N=128, M=192, iters=150_000, batch=8, crop=256,
             if it % log_every == 0:
                 w.writerow([it, loss.item(), bpp.item(), mse.item(), aux.item()]); logf.flush()
                 print(f"[lmbda={lmbda}] it {it}/{iters} loss {loss.item():.4f} bpp {bpp.item():.4f} "
-                      f"psnr~{-10 * np.log10(max(mse.item(), 1e-12)):.2f} aux {aux.item():.1f} {time.time() - t0:.0f}s", flush=True)
+                      f"psnr~{-10 * np.log10(max(mse.item(), 1e-12)):.2f} aux {aux.item():.1f} {time.time() - t0:.0f}s "
+                      f"data-wait {meter.fraction():.0%}" + (f" amp-skipped {net._amp_skipped}" if use_amp else ""), flush=True)
+                meter.reset()
             if it % ckpt_every == 0 or it == stop or guard.save_due():
                 save()
             if it < stop:
                 runtime.pause_if_needed(save, f"lmbda={lmbda}")
     logf.close()
+    net.amp = False                                                # the returned network is for eval / coding: always fp32
     if it >= iters:
         _atomic_save({"net": net.state_dict(), "it": it, "config": model_config(net, lmbda)}, out / "final.pt")
     return net
@@ -170,7 +192,10 @@ def main():
     ap.add_argument("--train-list", default=None)
     ap.add_argument("--init-from", default=None, help="final.pt of another lambda to fine-tune from")
     ap.add_argument("--act", choices=["gdn", "relu"], default="gdn", help="activation of g_a / g_s (relu = ablation A2)")
+    ap.add_argument("--amp", choices=["0", "1", "auto"], default=None, help="fp16 convolutions (fp32 GDN / entropy model / loss); default: $TS_CODEC_AMP, else 0")
     a = ap.parse_args()
+    if a.amp is not None:
+        os.environ["TS_CODEC_AMP"] = a.amp                        # train_codec(amp=None) reads it (so "auto" works too)
     train_codec(a.lmbda, a.out, K=a.K, N=a.N, M=a.M, iters=a.iters, batch=a.batch, crop=a.crop, lr=a.lr,
                 ckpt_every=a.ckpt_every, workers=a.workers, seed=a.seed, train_list=a.train_list, init_from=a.init_from,
                 act=a.act)

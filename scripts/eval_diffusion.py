@@ -30,6 +30,7 @@ from truesight.codec.train_codec import load_codec  # noqa: E402
 from truesight.codec.vae_codec import bpp_terms  # noqa: E402
 from truesight.data import read_list  # noqa: E402
 from truesight.diffusion.decode import coarse_decode, diffusion_decode  # noqa: E402
+from truesight.diffusion.sample import FirstStepCache  # noqa: E402
 from truesight.diffusion.eval_diffusion import checks, choose_default_w, fmt_table, summarize  # noqa: E402
 from truesight.diffusion.schedule import Schedule  # noqa: E402
 from truesight.diffusion.train_diffusion import load_unet  # noqa: E402
@@ -65,13 +66,16 @@ def prepare(files, codec, device, limit):
 
 
 def run_decode(items, unet, sched, w, steps, seed, tile, device, cache):
-    """Diffusion-decode every image (cached by (w, steps)). Returns per-image dicts incl. the decoded tensor."""
+    """Diffusion-decode every image (cached by (w, steps)). Returns per-image dicts incl. the decoded tensor.
+    The first denoising step (same noise, same condition, t = T-1) is identical for every w and every step count: it is computed once
+    per image and reused (``FirstStepCache`` per image; the check inside compares the actual tensors)."""
     key = (w, steps)
     if key not in cache:
         rows = []
         for it in items:
             t0 = time.perf_counter()
-            out = diffusion_decode(unet, sched, it["coarse_pad"], steps=steps, w=w, seed=seed, tile=tile)
+            fs = it.setdefault("first_step", FirstStepCache())
+            out = diffusion_decode(unet, sched, it["coarse_pad"], steps=steps, w=w, seed=seed, tile=tile, first_step=fs if tile is None else None)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             dt = time.perf_counter() - t0

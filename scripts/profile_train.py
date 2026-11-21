@@ -10,6 +10,9 @@ GPU consumes, the GPU waits and the cache is what speeds training up.
 Part 2, GPU step (synthetic fixed batch, so the loader is not in the way), milliseconds per optimiser step:
     diffusion  cudnn.benchmark off/on  x  channels_last off/on  (fp16 autocast, like train_diffusion), and the EMA update loop vs fused
     codec      cudnn.benchmark off/on, channels_last off/on  (fp32, like train_codec)
+    codec amp  the fp16-convolution hybrid (TS_CODEC_AMP, see scripts/amp_parity.py) next to fp32: the speed-up it could give
+    attention  fp16 scaled-dot-product attention at the U-Net's token counts: which backend runs on this GPU and how fast
+Verdict: whether the run is DATA-BOUND (the loader delivers fewer samples/s than the GPU consumes) or GPU-bound.
 Keep what the numbers support. Turn a setting off with TS_CUDNN_BENCHMARK=0 or TS_CHANNELS_LAST=none (see truesight/speed.py).
 """
 import argparse
@@ -92,21 +95,39 @@ def diffusion_step_ms(bench, cl_on, batch, crop, steps, channels):
     return ms, ema_fused, timed(loop, steps)
 
 
-def codec_step_ms(bench, cl_on, batch, crop, steps):
+def attention_ms(tokens, heads=8, dim=32, steps=10):
+    """ms per fp16 SDPA call at ``tokens`` positions for each backend that works on this GPU (None = failed / out of memory)."""
+    import torch.nn.functional as Fn
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    q = torch.randn(1, heads, tokens, dim, device="cuda", dtype=torch.float16)
+    out = {}
+    for name, be in (("efficient", SDPBackend.EFFICIENT_ATTENTION), ("flash", SDPBackend.FLASH_ATTENTION), ("math", SDPBackend.MATH)):
+        try:
+            with sdpa_kernel(be):
+                out[name] = timed(lambda: Fn.scaled_dot_product_attention(q, q, q), steps)
+        except Exception:
+            out[name] = None
+        torch.cuda.empty_cache()
+    return out
+
+
+def codec_step_ms(bench, cl_on, batch, crop, steps, amp=False):
     from truesight.codec.vae_codec import TrueSightCodec, rd_loss
     dev = torch.device("cuda")
     torch.backends.cudnn.benchmark = bench
     net = TrueSightCodec().to(dev).train()
+    net.amp = amp
     if cl_on:
         speed.to_channels_last(net.g_a, net.g_s, net.h_a)
     main, aux = net.split_parameters()
     opt, aopt = torch.optim.Adam(main, lr=1e-4), torch.optim.Adam(aux, lr=1e-3)
     x = speed.cl(torch.rand(batch, 3, crop, crop, device=dev), cl_on)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
 
     def step():
         out = net(x)
         loss, _, _ = rd_loss(out, x, 0.013)
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+        opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         a = net.aux_loss(); aopt.zero_grad(set_to_none=True); a.backward(); aopt.step()
     return timed(step, steps)
 
@@ -125,10 +146,12 @@ def main():
     a = ap.parse_args()
 
     print("== data loader (samples per second) ==")
+    rates = {}
     try:
         for crop, batch, name in ((a.diffusion_crop, a.diffusion_batch, "diffusion"), (a.codec_crop, a.codec_batch, "codec")):
             r0, _ = loader_rate(a.list, crop, batch, a.workers, a.loader_batches, cache=False)
             r1, used = loader_rate(a.list, crop, batch, a.workers, a.loader_batches, cache=None)
+            rates[name] = r1
             print(f"  {name:9s} crop {crop} x batch {batch}, {a.workers} workers: PNG decode {r0:7.1f}/s"
                   + (f"   cache {r1:7.1f}/s  ({r1 / r0:.1f}x)" if used else "   (no cache built: python scripts/build_cache.py)"))
     except FileNotFoundError as e:
@@ -146,8 +169,13 @@ def main():
         for cl_on in (False, True):
             ms, ema_f, ema_l = diffusion_step_ms(bench, cl_on, a.diffusion_batch, a.diffusion_crop, a.steps, CHANNELS)
             base = base or ms
-            print(f"  cudnn.benchmark={int(bench)} channels_last={int(cl_on)}: {ms:7.1f} ms ({a.diffusion_batch * 1000 / ms:6.1f} samples/s, {base / ms:.2f}x)"
+            gpu_rate = a.diffusion_batch * 1000 / ms
+            print(f"  cudnn.benchmark={int(bench)} channels_last={int(cl_on)}: {ms:7.1f} ms ({gpu_rate:6.1f} samples/s, {base / ms:.2f}x)"
                   f"   EMA update fused {ema_f:.2f} ms vs loop {ema_l:.2f} ms")
+    if "diffusion" in rates:
+        verdict = "DATA-BOUND: the loader is slower than the GPU, a faster loader would speed training up" if rates["diffusion"] < gpu_rate \
+            else "GPU-BOUND: the loader keeps up, the GPU is the limit (no gain from loader work)"
+        print(f"  verdict (diffusion): loader {rates['diffusion']:.0f}/s vs GPU {gpu_rate:.0f}/s -> {verdict}")
     print(f"codec step (batch {a.codec_batch}, {a.codec_crop}px, fp32), ms/step")
     base = None
     for bench in (False, True):
@@ -155,6 +183,17 @@ def main():
             ms = codec_step_ms(bench, cl_on, a.codec_batch, a.codec_crop, a.steps)
             base = base or ms
             print(f"  cudnn.benchmark={int(bench)} channels_last={int(cl_on)}: {ms:7.1f} ms ({a.codec_batch * 1000 / ms:6.1f} samples/s, {base / ms:.2f}x)")
+    fp32_ms = base
+    amp_ms = codec_step_ms(True, False, a.codec_batch, a.codec_crop, a.steps, amp=True)
+    print(f"  fp16 hybrid (amp=1, fp32 GDN / last layers / entropy model): {amp_ms:7.1f} ms ({a.codec_batch * 1000 / amp_ms:6.1f} samples/s, "
+          f"{fp32_ms / amp_ms:.2f}x vs fp32 without benchmark flag). Quality is NOT checked here: run scripts/amp_parity.py")
+    if "codec" in rates:
+        cg = a.codec_batch * 1000 / amp_ms
+        print(f"  verdict (codec, even at the fp16 speed): loader {rates['codec']:.0f}/s vs GPU {cg:.0f}/s -> "
+              + ("DATA-BOUND" if rates["codec"] < cg else "GPU-BOUND"))
+    print("attention, fp16, one head-batch of 8 heads x 32 dims (ms per call; None = not available here)")
+    for tokens in (4096, 16384, 24576):
+        print(f"  {tokens:6d} tokens: {attention_ms(tokens)}")
     print("Defaults in truesight/speed.py: cudnn.benchmark on; channels_last on for the fp16 U-Net, off for the fp32 codec. Change them with "
           "TS_CUDNN_BENCHMARK=0 / TS_CHANNELS_LAST=none|unet|all if a line above shows they do not help here.")
 

@@ -65,18 +65,41 @@ class TrueSightCodec(nn.Module):
                                  conv(M * 3 // 2, 3 * K * M, 3, 1))
         self.entropy_bottleneck = EntropyBottleneck(N)
         self.gmm = GMMConditional(K)
+        self.amp = False          # mixed precision for TRAINING only (see ``_seq``); set by train_codec, never on at eval / coding
+
+    def _seq(self, seq, x, amp=None, fp32_last=True):
+        """Run a Sequential, optionally with mixed precision.
+
+        amp off (default): exactly ``seq(x)``. amp on (CUDA): the plain convolutions run in fp16 under autocast (the Tensor-Core
+        work), everything numerically delicate stays fp32: GDN / IGDN / the activations (they divide and square), and, with
+        ``fp32_last``, the LAST layer of the stack. That last layer is what produces the latent y that is rounded, the
+        hyper-latent z, the mixture parameters (w, mu, sigma) and the reconstruction, so these keep fp32 precision: a fp16 error
+        in y would shift which integer it rounds to, a fp16 error in mu / sigma would shift every likelihood. The entropy model,
+        the likelihoods, the rate sum, the MSE and the auxiliary loss are all outside these stacks and stay fp32 as well."""
+        amp = self.amp if amp is None else amp
+        if not amp or not x.is_cuda:
+            return seq(x)
+        layers = list(seq)
+        for i, layer in enumerate(layers):
+            if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)) and not (fp32_last and i == len(layers) - 1):
+                with torch.autocast("cuda", dtype=torch.float16):
+                    x = layer(x)
+                x = x.float()
+            else:
+                x = layer(x.float())
+        return x
 
     def gmm_params(self, z_hat, shape):
         """Mixture parameters for a latent of ``shape`` = (B, M, H, W): (w_logits, mu, sigma), each (B,K,M,H,W)."""
         B, _, H, W = shape
-        p = self.h_s(z_hat).reshape(B, 3, self.K, self.M, H, W)
+        p = self._seq(self.h_s, z_hat).reshape(B, 3, self.K, self.M, H, W)
         return p[:, 0], p[:, 1], torch.exp(p[:, 2].clamp(max=LOG_SCALE_MAX))
 
     def forward(self, x):
         if x.shape[-1] % self.DOWN or x.shape[-2] % self.DOWN:
             raise ValueError(f"H and W must be multiples of {self.DOWN}, got {tuple(x.shape[-2:])}")
-        y = self.g_a(x)
-        z = self.h_a(y)
+        y = self._seq(self.g_a, x)
+        z = self._seq(self.h_a, y)
         z_hat, z_lik = self.entropy_bottleneck(z)                  # noise in train, rounding in eval
         w, mu, sigma = self.gmm_params(z_hat, y.shape)
         if self.training:
@@ -85,7 +108,7 @@ class TrueSightCodec(nn.Module):
         else:
             y_rate = y_dec = torch.round(y)
         y_lik = self.gmm.likelihood(y_rate, w, mu, sigma)
-        x_hat = self.g_s(y_dec)
+        x_hat = self._seq(self.g_s, y_dec)
         return {"x_hat": x_hat, "y": y, "y_hat": y_dec, "likelihoods": {"y": y_lik, "z": z_lik}}
 
     # ------------------------------------------------------------------ real bitstreams (Step 8)

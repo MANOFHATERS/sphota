@@ -33,6 +33,7 @@ from truesight.diffusion.eval_guidance import (METHODS, done_criteria, mean_hist
                                                 wins_by_pass)
 from truesight.diffusion.eval_diffusion import fmt_table  # noqa: E402
 from truesight.diffusion.guidance import consistency_rate, sphota_decode  # noqa: E402
+from truesight.diffusion.sample import PrefixCache  # noqa: E402
 from truesight.diffusion.schedule import Schedule  # noqa: E402
 from truesight.diffusion.train_diffusion import load_unet  # noqa: E402
 from truesight.metrics import lpips_dist, psnr  # noqa: E402
@@ -140,9 +141,10 @@ def main():
         br = roi.size_breakdown(blob)
         originals.append(pil)
         outs = {"coarse": prot.coarse.clamp(0, 1)}
+        prefix = PrefixCache()          # plain / ROI / guided decodes of this file share the steps before their guidance starts
         for name, kw in VARIANTS.items():
             track = (name == "plain" and i < a.hist_images)
-            o = sphota_decode(lo, hi, unet, sched, prot=prot, w=w, steps=steps, track_only=track, **kw, **gk)
+            o = sphota_decode(lo, hi, unet, sched, prot=prot, w=w, steps=steps, track_only=track, prefix=prefix, **kw, **gk)
             outs[name] = o.x
             if track:
                 hist_plain.append(o.guide.history)
