@@ -48,6 +48,8 @@ KW = dict(K=3, N=N, M=M, batch=2, crop=64, workers=0, log_every=1, ckpt_every=10
 
 # ---------------------------------------------------------------------------------------------------- the guard itself
 def test_guard_budget_and_cli(monkeypatch, capsys):
+    for k in ("TS_TIME_LIMIT_HOURS", "TS_SESSION_START", "TS_SAVE_EVERY_MIN"):      # the pipeline that runs the tests sets these
+        monkeypatch.delenv(k, raising=False)
     g = runtime.RunGuard(time_limit_h=1.0, start=time.time() - 3600 * 0.5, install_signals=False)
     assert 25 < g.remaining_min() < 35 and not g.stop_requested()
     assert runtime.RunGuard(time_limit_h=1.0, start=time.time() - 3700, install_signals=False).stop_requested()

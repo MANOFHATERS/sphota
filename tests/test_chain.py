@@ -262,6 +262,7 @@ def test_start_script_writes_a_notebook_without_pushing(tmp_path):
 def test_driver_refuses_to_start_without_a_hugging_face_token():
     import os
     env = {k: v for k, v in os.environ.items() if k not in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")}
+    env["TS_NO_KAGGLE_SECRETS"] = "1"          # on Kaggle the notebook's own secrets would otherwise be loaded and the session would really start
     r = subprocess.run([sys.executable, "scripts/kaggle_run.py", "--sync", "hf:u/r", "--no-git-pull", "--no-install"], cwd=ROOT, env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode != 0 and "HF_TOKEN not found" in (r.stderr + r.stdout)

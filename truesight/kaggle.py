@@ -76,7 +76,10 @@ def has_gpu():
 
 
 def load_kaggle_secrets(names=SECRET_NAMES):
-    """Copy Kaggle 'Add-ons > Secrets' into environment variables (does nothing outside Kaggle)."""
+    """Copy Kaggle 'Add-ons > Secrets' into environment variables (does nothing outside Kaggle, or with TS_NO_KAGGLE_SECRETS=1, which
+    the test suite sets so that tests never pick up the real tokens of the notebook they run in)."""
+    if os.environ.get("TS_NO_KAGGLE_SECRETS"):
+        return []
     try:
         from kaggle_secrets import UserSecretsClient
     except ImportError:
