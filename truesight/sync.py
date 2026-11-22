@@ -33,7 +33,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-KEEP_SUFFIXES = {".pt", ".csv", ".json", ".png", ".log", ".txt", ".md", ".yaml", ".npz"}
+KEEP_SUFFIXES = {".pt", ".csv", ".json", ".png", ".log", ".out", ".txt", ".md", ".yaml", ".npz"}   # .out = the console output of each job (experiments/logs/job_*.out)
 MAX_FILE_GB = 4.0
 BASELINE = ".sync_baseline.json"           # what this machine last saw in the storage (never uploaded itself)
 LOCK = ".sync.lock"

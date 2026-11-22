@@ -394,3 +394,8 @@ def test_a_dead_session_does_not_block_and_a_running_one_refreshes_its_entry(tmp
     assert (status, rc) == (kaggle.DONE, 0)
     mine = [e for e in kaggle.read_ledger(exp) if e["session"] != "dead"][0]
     assert mine["hours_used"] is not None and mine["hours_used"] > 0                            # finished: no longer "active"
+
+
+def test_job_console_logs_are_kept_in_the_run_repo():
+    """A crashed job's traceback lives in experiments/logs/job_<name>.out: it must reach Hugging Face so it can be read after the session."""
+    assert sync.wanted("logs/job_lmbda0.0483.out") and sync.wanted("logs/job_diffusion.out") and sync.wanted("logs/diffusion.log")
