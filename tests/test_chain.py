@@ -399,3 +399,45 @@ def test_a_dead_session_does_not_block_and_a_running_one_refreshes_its_entry(tmp
 def test_job_console_logs_are_kept_in_the_run_repo():
     """A crashed job's traceback lives in experiments/logs/job_<name>.out: it must reach Hugging Face so it can be read after the session."""
     assert sync.wanted("logs/job_lmbda0.0483.out") and sync.wanted("logs/job_diffusion.out") and sync.wanted("logs/diffusion.log")
+
+
+# ------------------------------------------------------------------------------------------------ rate limits (HTTP 429) and failed restores
+def test_retry_hf_retries_a_rate_limit_and_gives_up_after_the_last_attempt():
+    calls, waits = [], []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("HTTP status client error (429 Too Many Requests)")
+        return "ok"
+    assert sync.retry_hf(flaky, "test", sleep=waits.append, log=lambda m, **k: None) == "ok" and len(calls) == 3
+    assert waits == [30.0, 60.0]                                                       # the wait doubles
+    always = lambda: (_ for _ in ()).throw(RuntimeError("429"))
+    with pytest.raises(RuntimeError):
+        sync.retry_hf(always, "test", attempts=3, sleep=lambda s: None, log=lambda m, **k: None)
+
+
+def test_retry_hf_does_not_retry_a_missing_repo():
+    n = []
+
+    class Missing(Exception):
+        pass
+
+    def f():
+        n.append(1)
+        raise Missing()
+    with pytest.raises(Missing):
+        sync.retry_hf(f, "test", fatal=(Missing,), sleep=lambda s: None, log=lambda m, **k: None)
+    assert len(n) == 1
+
+
+def test_a_failed_restore_stops_the_session_instead_of_starting_from_scratch(tmp_path, monkeypatch):
+    """The first upload of a session that carried on after a failed restore would replace the real checkpoints with fresh ones."""
+    def boom(self, *a, **k):
+        raise RuntimeError("429 Too Many Requests")
+    monkeypatch.setattr(sync.Syncer, "pull", boom)
+    ran = tmp_path / "ran"
+    exp = tmp_path / "exp"; exp.mkdir()
+    status, rc = kaggle.run_session(ROOT, f"dir:{tmp_path / 'store'}", hours=1, cmd=[sys.executable, "-c", f"open({str(ran)!r},'w')"], exp_dir=exp,
+                                    do_git_pull=False, install=False, gpu=False)
+    assert (status, rc) == (kaggle.CRASHED, 1) and not ran.exists() and not (tmp_path / "store").exists()

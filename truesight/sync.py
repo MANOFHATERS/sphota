@@ -192,6 +192,32 @@ def heartbeat(local, session, now=None):
             _write_claim(local, p.stem, session, now=now)
 
 
+def retry_hf(fn, what, attempts=8, base_s=30.0, fatal=(), sleep=time.sleep, log=None):
+    """Run ``fn()``; when Hugging Face answers with a rate limit (429 Too Many Requests) or the network hiccups, wait and try again
+    (30 s, 60 s, 2 min, 4 min, 5 min ...). Downloads are resumable (finished files are skipped), so every attempt continues where the
+    last one stopped. Exceptions listed in ``fatal`` (a repo that does not exist) are raised at once. After the third failure the
+    Xet download path (the one that was rate limited) is switched off for the remaining attempts, which falls back to plain HTTPS."""
+    log = log or (lambda m, **kw: print(m, flush=True))
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except fatal:
+            raise
+        except Exception as e:
+            if i == attempts:
+                raise
+            wait = min(300.0, base_s * 2 ** (i - 1))
+            log(f"[sync] {what}: attempt {i}/{attempts} failed ({type(e).__name__}: {str(e)[:160]}); waiting {wait:.0f} s and retrying")
+            if i == 3:
+                try:
+                    import huggingface_hub.constants as hc
+                    hc.HF_HUB_DISABLE_XET = True
+                    log("[sync] switching off the Xet download path (plain HTTPS from now on)")
+                except Exception:
+                    pass
+            sleep(wait)
+
+
 def parse_spec(spec):
     kind, _, rest = spec.partition(":")
     if kind not in ("hf", "dir") or not rest:
@@ -283,8 +309,9 @@ class Syncer:
         self.local.mkdir(parents=True, exist_ok=True)
         patterns = None if only is None else [CLAIM_DIR + "/*", ".done/*"]
         try:
-            snapshot_download(self.target, repo_type="model", local_dir=str(self.local), token=self.token,
-                              allow_patterns=patterns)
+            retry_hf(lambda: snapshot_download(self.target, repo_type="model", local_dir=str(self.local), token=self.token,
+                                               allow_patterns=patterns, max_workers=4),
+                     "restore of the run state", fatal=(RepositoryNotFoundError,))
             remote = set(self._api().list_repo_files(self.target, repo_type="model"))
         except RepositoryNotFoundError:
             print(f"[sync] repo {self.target} does not exist yet: starting from scratch", flush=True)
@@ -381,8 +408,10 @@ def data_pull(repo, local_data, token=None):
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import RepositoryNotFoundError
     Path(local_data).mkdir(parents=True, exist_ok=True)
-    try:
-        snapshot_download(repo, repo_type="dataset", local_dir=str(local_data), token=_hf_token(token), allow_patterns=DATA_PATTERNS)
+    try:                                                              # 6,000+ files: a few at a time, and retry on a rate limit (HTTP 429)
+        retry_hf(lambda: snapshot_download(repo, repo_type="dataset", local_dir=str(local_data), token=_hf_token(token),
+                                           allow_patterns=DATA_PATTERNS, max_workers=4),
+                 "restore of the dataset", fatal=(RepositoryNotFoundError,))
     except RepositoryNotFoundError:
         print(f"[sync] dataset {repo} does not exist yet", flush=True)
         return False

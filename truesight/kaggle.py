@@ -306,9 +306,11 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
     log(f"data: {prepare_data(root, data_input, data_dir, data_repo)}")
     sync = Syncer(spec, exp)
     try:
-        sync.pull()
-    except Exception as e:                                         # a first session has nothing to pull
-        log(f"nothing restored ({type(e).__name__}: {e})")
+        sync.pull()                                                # (a repo that does not exist yet, the first session, is handled inside)
+    except Exception as e:
+        # NEVER carry on from scratch after a failed restore: the first upload would replace your real checkpoints with fresh ones
+        log(f"CANNOT RESTORE THE RUN STATE ({type(e).__name__}: {e}). Stopping so that nothing in {spec} is overwritten. Run again.")
+        return CRASHED, 1
     hours_limit = hours
     gpu = has_gpu() if gpu is None else gpu
     if gpu:
