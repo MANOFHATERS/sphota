@@ -244,3 +244,29 @@ def test_session_env_checkpoints_before_every_upload():
     env = kaggle.session_env("hf:u/r", 4.5, start=1.0, base={}, sync_every=15, session="S")
     assert float(env["TS_SAVE_EVERY_MIN"]) < 15 and env["TS_SESSION_ID"] == "S" and env["TS_TIME_LIMIT_HOURS"] == "4.5"
     assert kaggle.classify(76) == kaggle.NO_QUOTA
+
+
+# ------------------------------------------------------------------------------------------------ a pause must not become a "crash"
+def test_a_pause_does_not_terminate_the_other_jobs(tmp_path):
+    """One job pauses (75) first: the others keep running until they pause and save themselves (the real session budget is shared)."""
+    slow = _py(f"import time,pathlib; time.sleep(1.0); pathlib.Path({str(tmp_path / 'saved')!r}).write_text('saved'); raise SystemExit(75)")
+    jobs = [parallel.Job("a", _marker(tmp_path / "a", rc=75)), parallel.Job("b", slow)]
+    assert parallel.run_jobs(jobs, gpus=["0", "1"], poll=0.05, log=lambda m: None) == 75
+    assert (tmp_path / "saved").read_text() == "saved"                              # b was not killed mid-save
+
+
+def test_a_job_stopped_by_the_runner_after_a_crash_is_not_a_second_crash(tmp_path):
+    jobs = [parallel.Job("bad", _marker(tmp_path / "bad", sleep=0.2, rc=3)),
+            parallel.Job("long", _py("import time; time.sleep(30)"))]
+    t0 = time.time()
+    assert parallel.run_jobs(jobs, gpus=["0", "1"], poll=0.05, log=lambda m: None) == 3     # the crash is reported, not 143
+    assert time.time() - t0 < 20
+
+
+@pytest.mark.skipif(not parallel.POSIX, reason="process groups exist only on POSIX")
+def test_the_runner_waits_for_the_python_child_of_a_script_that_already_exited(tmp_path):
+    """A shell wrapper that exits (e.g. after SIGTERM) while its child is still saving a checkpoint must not end the job early."""
+    out = tmp_path / "child_done"
+    wrapper = ["bash", "-c", f"(sleep 1.2; echo saved > {out.as_posix()}) & exit 0"]
+    assert parallel.run_jobs([parallel.Job("w", wrapper)], gpus=["0"], poll=0.05, log=lambda m: None) == 0
+    assert out.exists()
