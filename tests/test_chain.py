@@ -441,3 +441,22 @@ def test_a_failed_restore_stops_the_session_instead_of_starting_from_scratch(tmp
     status, rc = kaggle.run_session(ROOT, f"dir:{tmp_path / 'store'}", hours=1, cmd=[sys.executable, "-c", f"open({str(ran)!r},'w')"], exp_dir=exp,
                                     do_git_pull=False, install=False, gpu=False)
     assert (status, rc) == (kaggle.CRASHED, 1) and not ran.exists() and not (tmp_path / "store").exists()
+
+
+# ------------------------------------------------------------------------------------------------ a cancelled session must not count as a full one
+def test_a_cancelled_session_is_settled_from_its_heartbeat_or_the_dead_hours_setting():
+    now = 1_000_000_000.0
+    day = 86400.0
+    cancelled_new = {"start": now - day, "reserved_h": 11.5, "hours_used": None, "last_seen": now - day + 1500}      # ran 25 min, then died
+    cancelled_old = {"start": now - day, "reserved_h": 11.5, "hours_used": None, "last_seen": now - day}              # no heartbeat evidence
+    running = {"start": now - 600, "reserved_h": 11.5, "hours_used": None, "last_seen": now - 30}
+    assert kaggle.used_quota_hours([cancelled_new], now) == pytest.approx(25 / 60 + 0.25, abs=0.01)                    # not 11.5 h
+    assert kaggle.used_quota_hours([cancelled_old], now) == pytest.approx(11.5)                                        # unknown: stay safe
+    assert kaggle.used_quota_hours([cancelled_old], now, dead_hours=0.5) == pytest.approx(0.5)                         # you said: assume 0.5 h
+    assert kaggle.used_quota_hours([running], now, dead_hours=0.5) == pytest.approx(600 / 3600 * 1.0 + 0.0, abs=1.2)  # a live session still counts (reservation capped at now)
+    b, _ = kaggle.plan_budget(11.5, weekly_quota=30, entries=[{"start": now - 3 * day, "reserved_h": 11.5, "hours_used": 11.4},
+                                                            cancelled_old], now=now, dead_hours=0.5)
+    assert b == pytest.approx(11.5)                                                                                      # 30 - 11.9 - 0.5 > 11.5
+    b2, _ = kaggle.plan_budget(11.5, weekly_quota=30, entries=[{"start": now - 3 * day, "reserved_h": 11.5, "hours_used": 11.4},
+                                                             cancelled_old], now=now)
+    assert b2 == pytest.approx(30 - 11.4 - 11.5 - 0.5)                                                                   # without the setting: 6.6 h

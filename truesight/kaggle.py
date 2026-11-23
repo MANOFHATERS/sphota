@@ -253,14 +253,25 @@ def next_reset(now, dow, hour=0):
     return last_reset(now, dow, hour) + 7 * 86400.0
 
 
-def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H, since=None):
+def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H, since=None, dead_hours=None):
     """GPU-session hours spent in the last ``window_h`` hours (or since the epoch time ``since``, the last weekly reset, when given).
     A finished session counts its real hours, a session without ``hours_used`` (still running or killed) counts its whole
-    reservation; only the part inside the window counts."""
+    reservation; only the part inside the window counts.
+
+    A session that is no longer alive but never wrote its end (cancelled, killed) is settled from the best evidence: its last heartbeat
+    (``last_seen``, refreshed every minute while it ran) if there is one; else ``dead_hours`` if you gave it (--dead-session-hours:
+    "assume a dead session used this many hours"); else, to be safe, its whole reservation. A session still alive counts in full."""
     now = time.time() if now is None else now
     lo, total = (now - window_h * 3600.0) if since is None else since, 0.0
     for e in entries:
         h = e.get("hours_used")
+        if h is None:
+            ls, start = e.get("last_seen"), float(e["start"])
+            alive = ls is not None and now - float(ls) < ACTIVE_STALE_S
+            if not alive and ls is not None and float(ls) - start > 90:             # a heartbeat proves how long it ran
+                h = min(float(e["reserved_h"]), (float(ls) - start) / 3600.0 + 0.25)
+            elif not alive and dead_hours is not None:
+                h = min(float(e["reserved_h"]), float(dead_hours))
         h = float(e["reserved_h"] if h is None else h)
         a, b = float(e["start"]), float(e["start"]) + h * 3600.0
         overlap = max(0.0, min(b, now) - max(a, lo))
@@ -268,7 +279,7 @@ def used_quota_hours(entries, now=None, window_h=QUOTA_WINDOW_H, since=None):
     return total
 
 
-def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None, margin_h=QUOTA_MARGIN_H, reset=None):
+def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None, margin_h=QUOTA_MARGIN_H, reset=None, dead_hours=None):
     """(budget in hours, explanation). ``hours`` is the session limit (11.5); the quota only ever lowers it.
     ``reset`` = (weekday, utc_hour) of the weekly quota reset (Monday = 0): the ledger then counts only the hours since the last
     reset instead of the last 7 days (exact, and the quota is full again right after the reset)."""
@@ -277,7 +288,7 @@ def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None
         budget, why = quota_hours - margin_h, f"{quota_hours} h of quota left - {margin_h} h margin"
     if weekly_quota is not None:
         t = time.time() if now is None else now
-        used = used_quota_hours(entries, t, since=None if reset is None else last_reset(t, *reset))
+        used = used_quota_hours(entries, t, since=None if reset is None else last_reset(t, *reset), dead_hours=dead_hours)
         left = weekly_quota - used - margin_h
         if left < budget:
             span = "in the last 7 days" if reset is None else "since the last weekly reset"
@@ -287,7 +298,7 @@ def plan_budget(hours, quota_hours=None, weekly_quota=None, entries=(), now=None
 
 def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_input=None, data_dir=None, data_repo=None,
                 sync_every=DEFAULT_SYNC_MIN, do_git_pull=True, install=True, env_extra=None, quota_hours=None, weekly_quota=None,
-                gpu=None, reset=None, heartbeat_s=60.0):
+                gpu=None, reset=None, heartbeat_s=60.0, dead_hours=None):
     """Run one session. Returns (status, exit code). ``cmd`` defaults to the full pipeline.
     ``quota_hours`` / ``weekly_quota`` / ``reset``: see the module docstring; the budget is lowered to what the quota allows.
     ``gpu``: does this session use the GPU quota? None = detect. A CPU-only session (the data download) uses no quota: it gets the full
@@ -314,7 +325,7 @@ def run_session(root, spec, hours=DEFAULT_HOURS, cmd=None, exp_dir=None, data_in
     hours_limit = hours
     gpu = has_gpu() if gpu is None else gpu
     if gpu:
-        hours, why = plan_budget(hours_limit, quota_hours, weekly_quota, read_ledger(exp), start, reset=reset)
+        hours, why = plan_budget(hours_limit, quota_hours, weekly_quota, read_ledger(exp), start, reset=reset, dead_hours=dead_hours)
     else:
         why = "CPU-only session: no GPU quota used"
     LAST_SESSION.update(session=session, start=start, budget_h=hours, gpu=gpu, hours_used=0.0)

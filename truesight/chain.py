@@ -55,6 +55,7 @@ class ChainConfig:
     weekly_quota: float = None
     quota_hours: float = None
     hours_limit: float = kaggle.DEFAULT_HOURS
+    dead_hours: float = None                     # hours a cancelled / killed session is assumed to have used (see kaggle.used_quota_hours)
 
 
 # ------------------------------------------------------------------------------------------------ files of a notebook
@@ -248,7 +249,7 @@ def quota_left_h(cfg, exp_dir, now=None, quota_hours_next=None):
     """The session budget (hours) the next GPU session would get, from the ledger / the remaining explicit quota."""
     now = time.time() if now is None else now
     b, _ = kaggle.plan_budget(cfg.hours_limit, quota_hours_next if quota_hours_next is not None else cfg.quota_hours, cfg.weekly_quota,
-                              kaggle.read_ledger(exp_dir), now, reset=cfg.reset)
+                              kaggle.read_ledger(exp_dir), now, reset=cfg.reset, dead_hours=cfg.dead_hours)
     return b
 
 

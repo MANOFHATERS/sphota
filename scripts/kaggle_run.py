@@ -28,7 +28,7 @@ def chain_config(a):
     return chain.ChainConfig(owner=a.chain_owner or "", gpu_slug=a.chain_gpu_slug, cpu_slug=a.chain_cpu_slug, wait_slug=a.chain_wait_slug,
                              kind=a.chain_kind, count=a.chain_count, max_chain=a.max_chain, repo=a.chain_repo,
                              machine_shape=a.machine_shape, reset=reset, wait_until=a.wait_until, weekly_quota=a.weekly_quota,
-                             quota_hours=a.quota_hours, hours_limit=a.hours)
+                             quota_hours=a.quota_hours, hours_limit=a.hours, dead_hours=a.dead_session_hours)
 
 
 def main():
@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--quota-reset-dow", type=int, default=None, help="weekday of the weekly quota reset, Monday = 0 (UTC): the ledger then counts since the last reset, and a waiter notebook can sleep until it")
     ap.add_argument("--quota-reset-hour", type=int, default=0, help="UTC hour of the weekly quota reset")
     ap.add_argument("--claims", action="store_true", help="two notebooks work on the same run repo at the same time: claim every stage first so they never run the same one (give them different --stages)")
+    ap.add_argument("--dead-session-hours", type=float, default=None, help="a cancelled or killed session leaves no end time: assume it used this many GPU hours (default: its whole 11.5 h reservation, which over-counts). Example: 0.5")
     ap.add_argument("--no-git-pull", action="store_true")
     ap.add_argument("--no-install", action="store_true")
     ch = ap.add_argument_group("chaining (truesight/chain.py): start the next notebook automatically")
@@ -86,7 +87,7 @@ def main():
     reset = None if a.quota_reset_dow is None else (a.quota_reset_dow, a.quota_reset_hour)
     gpu = False if a.chain_kind == "cpu_data" else None
     status, rc = kaggle.run_session(ROOT, a.sync, a.hours, data_input=a.data_input, data_dir=a.data_dir, data_repo=a.data_repo,
-                                    sync_every=a.sync_every, quota_hours=a.quota_hours, weekly_quota=a.weekly_quota, gpu=gpu, reset=reset,
+                                    sync_every=a.sync_every, quota_hours=a.quota_hours, weekly_quota=a.weekly_quota, gpu=gpu, reset=reset, dead_hours=a.dead_session_hours,
                                     do_git_pull=not a.no_git_pull, install=not a.no_install, env_extra=env)
     if a.chain:
         from truesight import chain
