@@ -91,6 +91,13 @@ require() {
   [ -e "$1" ] && return 0
   echo "=== $1 does not exist yet: stage '$2' has to finish first (maybe in another notebook). Run this again afterwards."; exit 75
 }
+# Parts of a multi-part stage (protect: text, face / guidance: tuning + four sets / intelligence: table + learner). A part that finished in an
+# earlier session leaves .done/part_<name> (content = fingerprint of the models it was run on, uploaded with the run state), so a stage that
+# was cut off by the time budget does not redo the parts it already finished. A part cut off in the middle still restarts from its first
+# image. If the models change (diffusion trained further, another codec) the fingerprint differs and the part runs again.
+part_fp() { [ -n "${_PART_FP:-}" ] || _PART_FP=$(cat "$UNET" "$LO" "$HI" 2>/dev/null | sha1sum | cut -d' ' -f1); echo "$_PART_FP"; }
+part_done() { [ -e "$EXP/.done/part_$1" ] && [ "$(cat "$EXP/.done/part_$1")" = "$(part_fp)" ]; }
+part_mark() { part_fp > "$EXP/.done/part_$1"; }
 done_() {
   touch "$EXP/.done/$1"; echo "=== [$1] finished $(date -u +%FT%TZ)"
   if [ -n "${TS_SYNC:-}" ]; then $PY -m truesight.sync push --dir "$EXP" --spec "$TS_SYNC" || echo "(upload failed, will retry later)"; fi
@@ -228,9 +235,11 @@ stage_protect() {
     require "$UNET" diffusion
     require "$HI" codec
     for S in text face; do
+      if part_done "protect_$S"; then echo "=== [protect] $S finished in an earlier session: skipped"; continue; fi
       need 30
       run protect $PY scripts/eval_protect.py --set $S --limit $(nimg $S) --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" \
           --steps $STEPS --tfr --fir --device $DEV --figs "$FIGS" --out "$EXP/step11_protect/$S"
+      part_mark "protect_$S"
     done
     done_ protect
   fi
@@ -241,12 +250,16 @@ stage_guidance() {
     need 60
     require "$UNET" diffusion
     require "$HI" codec
+    if part_done guidance_tune && [ -e "$FROZEN" ]; then echo "=== [guidance] tuning finished in an earlier session: skipped"; else
     run guidance $PY scripts/tune_guidance.py --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" --limit $TUNE_N \
         --steps $MAIN_STEPS --tfr --fir --device $DEV --out "$EXP/step12_guidance"
+    part_mark guidance_tune; fi
     for S in text face kodak clic; do
+      if part_done "guidance_$S"; then echo "=== [guidance] $S finished in an earlier session: skipped"; continue; fi
       need 30
       run guidance $PY scripts/eval_sphota.py --set $S --limit $(nimg $S) --codec-lo "$LO" --codec-hi "$HI" --diffusion "$UNET" \
           --frozen "$FROZEN" --steps $MAIN_STEPS --tfr --fir --device $DEV --figs "$FIGS" --out "$EXP/step12_guidance/eval_$S"
+      part_mark "guidance_$S"
     done
     done_ guidance
   fi
@@ -268,8 +281,10 @@ stage_intelligence() {
     need 60
     require "$UNET" diffusion
     require "$HI" codec
+    if part_done intelligence_table; then echo "=== [intelligence] mode table finished in an earlier session: skipped"; else
     run intelligence $PY scripts/build_mode_table.py --list data/processed/train.txt --limit $N_TBL --codecs-dir "$CODEC" \
         --real-bytes --diffusion "$UNET" --steps $STEPS --ocr --faces --device $DEV --out "$EXP/step14_intelligence"
+    part_mark intelligence_table; fi
     run intelligence $PY scripts/train_intelligence.py --data "$EXP/step14_intelligence" --figs "$FIGS"
     done_ intelligence
   fi

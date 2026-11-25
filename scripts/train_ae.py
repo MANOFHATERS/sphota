@@ -43,6 +43,31 @@ def sample_figure(rows, test_list, idxs, path):
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
+def figure_idxs(n):
+    """The test images shown in ae_samples.png (the same rule as before: four, spread over the set)."""
+    return list(range(0, n, max(1, n // 4)))[:4]
+
+
+def load_eval_cache(run, meta):
+    """The evaluation of a run that finished training in an earlier session (stored by save_eval_cache), or None.
+    Only valid for the very same settings: any difference in ``meta`` means it is evaluated again."""
+    f = run / "eval_cache.pt"
+    try:
+        c = torch.load(f, map_location="cpu", weights_only=False) if f.exists() else None
+    except Exception as e:                                       # a half-written / unreadable cache is just a miss
+        print(f"[{run.name}] eval cache unreadable ({type(e).__name__}), evaluating again", flush=True)
+        return None
+    return c if c and c.get("meta") == meta else None
+
+
+def save_eval_cache(run, meta, res, recons):
+    """Keep the metrics and only the reconstructions the figure uses (4 images), not all of them."""
+    keep = {i: recons[i] for i in figure_idxs(len(recons))}
+    tmp = run / "eval_cache.pt.tmp"
+    torch.save({"meta": meta, "res": res, "recons": keep}, tmp)
+    tmp.replace(run / "eval_cache.pt")
+
+
 def bits_figure(df, path):
     import matplotlib
     matplotlib.use("Agg")
@@ -80,10 +105,18 @@ def main():
     for seed in a.seeds:
         for M in a.M:
             run = out / f"M{M}_s{seed}"
-            model, _ = train_ae(a.train_list, run, M=M, N=a.N, iters=a.iters, batch=a.batch, crop=a.crop, lr=a.lr,
-                                seed=seed, workers=a.workers)
-            res, recons = evaluate_ae(model, a.test_list, max_images=a.max_test)
-            res.update(M=M, seed=seed, N=a.N, iters=a.iters, batch=a.batch, crop=a.crop)
+            meta = dict(M=M, seed=seed, N=a.N, iters=a.iters, batch=a.batch, crop=a.crop, lr=a.lr,
+                        test_list=str(a.test_list), max_test=a.max_test)
+            cached = load_eval_cache(run, meta)
+            if cached is not None:                              # trained and evaluated in an earlier session: nothing to redo
+                res, recons = cached["res"], cached["recons"]
+                print(f"[M={M}] already trained and evaluated (eval_cache.pt): skipped", flush=True)
+            else:
+                model, _ = train_ae(a.train_list, run, M=M, N=a.N, iters=a.iters, batch=a.batch, crop=a.crop, lr=a.lr,
+                                    seed=seed, workers=a.workers)
+                res, recons = evaluate_ae(model, a.test_list, max_images=a.max_test)
+                res.update(M=M, seed=seed, N=a.N, iters=a.iters, batch=a.batch, crop=a.crop)
+                save_eval_cache(run, meta, res, recons)
             rows.append({**res, "recons": recons})
             print(f"== M={M} seed={seed}: PSNR {res['psnr']:.2f} dB, {res['bpp']:.4f} bpp, "
                   f"latent range [{res['latent_min']}, {res['latent_max']}], {res['latent_unique']} symbols", flush=True)
@@ -95,8 +128,7 @@ def main():
     print("\n" + df[["M", "seed", "psnr", "bpp", "bits_per_image_mean", "latent_min", "latent_max", "latent_unique"]]
           .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     first = [r for r in rows if r["seed"] == a.seeds[0]]
-    sample_figure(first, a.test_list, list(range(0, first[0]["n_images"], max(1, first[0]["n_images"] // 4)))[:4],
-                  figs / "ae_samples.png")
+    sample_figure(first, a.test_list, figure_idxs(first[0]["n_images"]), figs / "ae_samples.png")
     bits_figure(df, figs / "ae_bits_vs_M.png")
     print(f"saved {out/'results.csv'}, {figs/'ae_samples.png'}, {figs/'ae_bits_vs_M.png'}")
 
