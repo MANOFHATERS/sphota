@@ -60,11 +60,15 @@ def main():
             print(f"=== training {name} ({ABLATIONS[name][0]}): {kw or 'reference'}", flush=True)
             train_diffusion(a.codec, d, iters=a.iters, batch=a.batch, crop=a.crop, channels=tuple(a.channels),
                             workers=a.workers, ckpt_every=a.ckpt_every, train_list=a.train_list, **kw)
-        unet, ucfg = load_unet(d / "final.pt", dev)
-        sched = Schedule(ucfg["T"], ucfg["kind"], device=dev)
-        df = evaluate_unet(unet, sched, codec, files, steps=a.steps, w=a.w, device=dev, max_images=a.eval_images,
-                           crop=a.eval_crop)
-        df.insert(0, "run", name); df.to_csv(d / "eval.csv", index=False)
+        if (d / "eval.csv").exists():                       # evaluated in an earlier session: do not spend GPU time again
+            df = pd.read_csv(d / "eval.csv")
+            print(f"{name}: eval.csv already there, not evaluating again", flush=True)
+        else:
+            unet, ucfg = load_unet(d / "final.pt", dev)
+            sched = Schedule(ucfg["T"], ucfg["kind"], device=dev)
+            df = evaluate_unet(unet, sched, codec, files, steps=a.steps, w=a.w, device=dev, max_images=a.eval_images,
+                               crop=a.eval_crop)
+            df.insert(0, "run", name); df.to_csv(d / "eval.csv", index=False)
         results[name], tails[name] = df, train_loss_tail(d / "log.csv")
         print(f"{name}: LPIPS {df.lpips.mean():.4f} PSNR {df.psnr.mean():.2f}", flush=True)
     pd.concat(results.values(), ignore_index=True).to_csv(out / "results.csv", index=False)
