@@ -14,3 +14,6 @@ data/raw/*
 # decoded-image cache (about 41 GB, rebuilt by scripts/build_cache.py)
 data/cache/
 *.u8
+
+# the demo cache keeps the seed of each captured photo (so its download works when replayed)
+!demo_cache/**/seed.sphota
